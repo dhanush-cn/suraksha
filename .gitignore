@@ -1,6 +1,7 @@
-# Exclude large zip datasets and raw extracted image folders
+# Exclude large zip datasets and unzipped image folders
 data/*.zip
 data/extracted_pit_images/
+data/Open-Pit-Mine-Object-Detection-Dataset/
 *.db
 __pycache__/
 *.pyc
