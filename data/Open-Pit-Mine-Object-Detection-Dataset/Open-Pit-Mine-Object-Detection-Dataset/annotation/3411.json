@@ -1,0 +1,80 @@
+{
+    "version": "5.4.1",
+    "flags": {},
+    "shapes": [
+        {
+            "label": "1",
+            "points": [
+                [
+                    271.02061855670104,
+                    762.7731958762887
+                ],
+                [
+                    361.74226804123714,
+                    890.0927835051547
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    436.4845360824743,
+                    601.9484536082474
+                ],
+                [
+                    523.59793814433,
+                    731.3298969072165
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    525.1443298969073,
+                    627.7216494845361
+                ],
+                [
+                    609.680412371134,
+                    683.3917525773196
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    614.319587628866,
+                    672.5670103092783
+                ],
+                [
+                    676.1752577319588,
+                    780.2989690721649
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        }
+    ],
+    "imageHeight": 1024,
+    "imageWidth": 1024
+}

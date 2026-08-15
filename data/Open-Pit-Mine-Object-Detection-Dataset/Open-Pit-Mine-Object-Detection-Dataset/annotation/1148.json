@@ -1,0 +1,80 @@
+{
+    "version": "5.4.1",
+    "flags": {},
+    "shapes": [
+        {
+            "label": "1",
+            "points": [
+                [
+                    562.5952380952381,
+                    465.57142857142856
+                ],
+                [
+                    403.6666666666667,
+                    609.6190476190476
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    359.61904761904765,
+                    351.2857142857143
+                ],
+                [
+                    117.35714285714283,
+                    579.8571428571429
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    730.4523809523808,
+                    416.76190476190476
+                ],
+                [
+                    597.1190476190476,
+                    303.6666666666667
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    173.3095238095238,
+                    709.6190476190476
+                ],
+                [
+                    2.842170943040401e-14,
+                    514.2096516458932
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        }
+    ],
+    "imageHeight": 1024,
+    "imageWidth": 1024
+}

@@ -1,0 +1,80 @@
+{
+    "version": "5.4.1",
+    "flags": {},
+    "shapes": [
+        {
+            "label": "1",
+            "points": [
+                [
+                    199.82051282051287,
+                    203.02564102564105
+                ],
+                [
+                    481.87179487179486,
+                    446.61538461538464
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    534.4358974358975,
+                    400.46153846153845
+                ],
+                [
+                    748.5384615384617,
+                    762.0
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    692.8219178082193,
+                    210.63013698630135
+                ],
+                [
+                    822.9589041095891,
+                    355.83561643835617
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    822.9589041095891,
+                    280.4931506849315
+                ],
+                [
+                    925.6986301369864,
+                    436.6575342465753
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        }
+    ],
+    "imageHeight": 1024,
+    "imageWidth": 1024
+}

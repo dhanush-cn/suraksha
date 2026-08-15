@@ -1,0 +1,80 @@
+{
+    "version": "5.4.1",
+    "flags": {},
+    "shapes": [
+        {
+            "label": "1",
+            "points": [
+                [
+                    259.5609756097561,
+                    508.7479674796748
+                ],
+                [
+                    603.4634146341464,
+                    774.6016260162602
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    709.1544715447155,
+                    529.8861788617886
+                ],
+                [
+                    798.5853658536587,
+                    664.8455284552846
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    597.7723577235772,
+                    486.7967479674797
+                ],
+                [
+                    739.2357723577236,
+                    552.650406504065
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    740.8617886178861,
+                    361.5934959349594
+                ],
+                [
+                    902.6504065040651,
+                    529.8861788617886
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        }
+    ],
+    "imageHeight": 1024,
+    "imageWidth": 1024
+}

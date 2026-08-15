@@ -1,0 +1,80 @@
+{
+    "version": "5.4.1",
+    "flags": {},
+    "shapes": [
+        {
+            "label": "1",
+            "points": [
+                [
+                    461.99999999999994,
+                    472.5670103092784
+                ],
+                [
+                    580.5567010309278,
+                    597.3092783505155
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    542.9278350515465,
+                    618.9587628865979
+                ],
+                [
+                    727.979381443299,
+                    708.1340206185567
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    877.979381443299,
+                    376.17525773195877
+                ],
+                [
+                    1018.1855670103093,
+                    500.9175257731959
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    970.2474226804125,
+                    151.43298969072163
+                ],
+                [
+                    1023.0,
+                    286.19184629803163
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        }
+    ],
+    "imageHeight": 1024,
+    "imageWidth": 1024
+}

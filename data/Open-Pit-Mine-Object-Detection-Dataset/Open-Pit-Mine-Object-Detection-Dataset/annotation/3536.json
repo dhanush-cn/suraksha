@@ -1,0 +1,80 @@
+{
+    "version": "5.4.1",
+    "flags": {},
+    "shapes": [
+        {
+            "label": "1",
+            "points": [
+                [
+                    159.94520547945206,
+                    61.315068493150676
+                ],
+                [
+                    269.5342465753424,
+                    2.4109589041095774
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    395.5616438356164,
+                    173.64383561643834
+                ],
+                [
+                    465.4246575342466,
+                    235.2876712328767
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    459.945205479452,
+                    106.52054794520548
+                ],
+                [
+                    536.6575342465754,
+                    222.958904109589
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    642.1369863013699,
+                    185.972602739726
+                ],
+                [
+                    707.8904109589041,
+                    251.72602739726028
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        }
+    ],
+    "imageHeight": 1024,
+    "imageWidth": 1024
+}

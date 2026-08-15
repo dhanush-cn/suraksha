@@ -1,0 +1,80 @@
+{
+    "version": "5.4.1",
+    "flags": {},
+    "shapes": [
+        {
+            "label": "1",
+            "points": [
+                [
+                    6.642857142857167,
+                    538.1904761904761
+                ],
+                [
+                    288.78571428571433,
+                    814.3809523809524
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    470.13008130081295,
+                    437.2032520325203
+                ],
+                [
+                    642.4878048780488,
+                    594.9268292682927
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    644.1138211382113,
+                    499.8048780487805
+                ],
+                [
+                    772.5691056910568,
+                    551.8373983739838
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    652.2439024390244,
+                    566.4715447154472
+                ],
+                [
+                    718.9105691056911,
+                    610.3739837398374
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        }
+    ],
+    "imageHeight": 1024,
+    "imageWidth": 1024
+}

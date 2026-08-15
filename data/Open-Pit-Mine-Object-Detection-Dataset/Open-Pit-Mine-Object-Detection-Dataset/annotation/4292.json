@@ -1,0 +1,80 @@
+{
+    "version": "5.4.1",
+    "flags": {},
+    "shapes": [
+        {
+            "label": "1",
+            "points": [
+                [
+                    457.9349593495935,
+                    255.90243902439025
+                ],
+                [
+                    641.6747967479675,
+                    696.5528455284554
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    657.9349593495936,
+                    265.6585365853659
+                ],
+                [
+                    935.9837398373984,
+                    655.089430894309
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    927.8536585365855,
+                    536.390243902439
+                ],
+                [
+                    993.7073170731708,
+                    629.8861788617886
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    939.2357723577236,
+                    442.89430894308947
+                ],
+                [
+                    1021.3495934959351,
+                    533.9512195121952
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        }
+    ],
+    "imageHeight": 1024,
+    "imageWidth": 1024
+}

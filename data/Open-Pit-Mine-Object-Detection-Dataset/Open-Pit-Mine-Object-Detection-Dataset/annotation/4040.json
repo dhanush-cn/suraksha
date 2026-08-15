@@ -1,0 +1,116 @@
+{
+    "version": "5.4.1",
+    "flags": {},
+    "shapes": [
+        {
+            "label": "1",
+            "points": [
+                [
+                    614.0325203252032,
+                    131.5121951219512
+                ],
+                [
+                    718.9105691056911,
+                    196.55284552845526
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    738.4227642276423,
+                    248.58536585365852
+                ],
+                [
+                    796.959349593496,
+                    296.5528455284553
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    931.918699186992,
+                    233.9512195121951
+                ],
+                [
+                    962.8130081300812,
+                    272.1626016260163
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    760.3739837398375,
+                    340.45528455284557
+                ],
+                [
+                    803.4634146341464,
+                    364.0325203252033
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    717.2845528455284,
+                    6.308943089430887
+                ],
+                [
+                    783.1382113821139,
+                    111.1869918699187
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    880.69918699187,
+                    2.2439024390243825
+                ],
+                [
+                    953.0569105691056,
+                    119.3170731707317
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        }
+    ],
+    "imageHeight": 1024,
+    "imageWidth": 1024
+}

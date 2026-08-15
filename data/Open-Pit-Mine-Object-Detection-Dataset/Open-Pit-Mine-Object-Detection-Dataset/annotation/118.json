@@ -1,0 +1,80 @@
+{
+    "version": "5.4.1",
+    "flags": {},
+    "shapes": [
+        {
+            "label": "1",
+            "points": [
+                [
+                    497.7142857142857,
+                    366.62184873949576
+                ],
+                [
+                    664.1008403361345,
+                    532.1680672268908
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "1",
+            "points": [
+                [
+                    746.453781512605,
+                    376.70588235294116
+                ],
+                [
+                    817.8823529411764,
+                    446.453781512605
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "n",
+            "points": [
+                [
+                    485.10924369747903,
+                    359.05882352941177
+                ],
+                [
+                    389.31092436974785,
+                    547.2941176470588
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        },
+        {
+            "label": "n",
+            "points": [
+                [
+                    662.8474576271187,
+                    739.1186440677966
+                ],
+                [
+                    425.4453781512605,
+                    511.15966386554624
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": null
+        }
+    ],
+    "imageHeight": 1024,
+    "imageWidth": 1024
+}

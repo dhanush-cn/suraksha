@@ -1,0 +1,9 @@
+# Exclude large zip datasets and raw extracted image folders
+data/*.zip
+data/extracted_pit_images/
+*.db
+__pycache__/
+*.pyc
+.env
+.idea/
+.vscode/
