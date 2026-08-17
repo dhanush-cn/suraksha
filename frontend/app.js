@@ -314,6 +314,47 @@ function setupEventListeners() {
         }
     });
 
+    // CSV Upload Form Submit
+    document.getElementById("csvUploadForm")?.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const fileInput = document.getElementById("csvFileInput");
+        if (!fileInput || !fileInput.files[0]) {
+            alert("Please select a CSV file first.");
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append("file", fileInput.files[0]);
+
+        const resDiv = document.getElementById("uploadResult");
+        if (resDiv) {
+            resDiv.innerHTML = "⏳ Processing & Evaluating Telemetry CSV Data...";
+            resDiv.classList.remove("hidden");
+        }
+
+        try {
+            const url = window.location.origin + "/api/upload_csv";
+            const res = await fetch(url, {
+                method: "POST",
+                body: formData
+            });
+            const data = await res.json();
+            if (res.ok) {
+                resDiv.innerHTML = `
+                    <div style="padding: 0.5rem; border-radius: 6px; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3);">
+                        <strong style="color: #34d399;">✓ CSV Analysis Complete!</strong><br>
+                        <strong>Status:</strong> ${data.message}<br>
+                        <strong>Detected Columns:</strong> ${data.columns.join(", ")}
+                    </div>
+                `;
+            } else {
+                resDiv.innerHTML = `<span style="color: #ef4444;">Error: ${data.detail}</span>`;
+            }
+        } catch (err) {
+            if (resDiv) resDiv.innerHTML = `<span style="color: #ef4444;">Network Error: ${err.message}</span>`;
+        }
+    });
+
     // Drone Upload Form Submit
     const droneFormElem = document.getElementById("droneImageForm") || document.getElementById("droneUploadForm");
     droneFormElem?.addEventListener("submit", async (e) => {
