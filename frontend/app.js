@@ -341,10 +341,12 @@ function setupEventListeners() {
             const data = await res.json();
             if (res.ok) {
                 resDiv.innerHTML = `
-                    <div style="padding: 0.5rem; border-radius: 6px; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3);">
-                        <strong style="color: #34d399;">✓ CSV Analysis Complete!</strong><br>
-                        <strong>Status:</strong> ${data.message}<br>
-                        <strong>Detected Columns:</strong> ${data.columns.join(", ")}
+                    <div style="padding: 0.75rem; border-radius: 8px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.4); line-height: 1.6;">
+                        <strong style="color: #34d399; font-size: 0.95rem;">✓ Geotechnical Evaluation Complete!</strong><br>
+                        <strong>Dataset:</strong> ${fileInput.files[0].name} (${data.total_records} Telemetry Rows Evaluated)<br>
+                        <strong>Mean Failure Risk:</strong> <span style="color: #60a5fa; font-weight: 700;">${data.avg_risk_percentage}%</span> | <strong>Peak Risk:</strong> <span style="color: #f87171; font-weight: 700;">${data.max_risk_percentage}%</span><br>
+                        <strong>Risk Tiers:</strong> 🟢 Safe: ${data.safe_records} | 🟡 Warning: ${data.warning_records} | 🔴 Critical: ${data.critical_records}<br>
+                        <strong>Primary Hazard Factor:</strong> ${data.top_risk_driver}
                     </div>
                 `;
             } else {

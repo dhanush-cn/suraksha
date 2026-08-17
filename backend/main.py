@@ -129,8 +129,8 @@ def get_mine_live_telemetry(mine_id: int, scenario: str = Query("normal")):
     # Fetch real live weather for mine GPS coordinates
     weather = fetch_open_meteo_weather(target_mine["latitude"], target_mine["longitude"])
     
-    # Generate sensor telemetry frame
-    telemetry = simulator_instance.generate_telemetry_frame(scenario=scenario, weather_data=weather)
+    # Generate sensor telemetry frame for specific mine
+    telemetry = simulator_instance.generate_telemetry_frame(scenario=scenario, weather_data=weather, mine_info=target_mine)
     
     # Run ML Inference
     prediction_input = {**telemetry, "mine_id": mine_id}
@@ -184,11 +184,43 @@ async def upload_custom_dataset(file: UploadFile = File(...)):
     try:
         df = pd.read_csv(file_path)
         rows, cols = df.shape
+        
+        # Batch evaluate ML risk across rows
+        risk_scores = []
+        safe_count, warn_count, crit_count = 0, 0, 0
+        
+        for _, row in df.iterrows():
+            pred = predict_rockfall_risk(row.to_dict())
+            rp = pred["risk_percentage"]
+            risk_scores.append(rp)
+            if rp >= 65.0:
+                crit_count += 1
+            elif rp >= 35.0:
+                warn_count += 1
+            else:
+                safe_count += 1
+                
+        avg_risk = float(np.mean(risk_scores)) if risk_scores else 0.0
+        max_risk = float(np.max(risk_scores)) if risk_scores else 0.0
+        
+        # Identify top physical driver from columns
+        top_driver = "Accelerated Creep Velocity"
+        if "pore_pressure_kpa" in df.columns and df["pore_pressure_kpa"].mean() > 50.0:
+            top_driver = "Pore Pressure & Hydro-Kinematic Saturation"
+        elif "rainfall_mm" in df.columns and df["rainfall_mm"].mean() > 10.0:
+            top_driver = "Monsoon Rainfall Intensity"
+            
         return {
             "status": "success",
-            "message": f"Successfully uploaded '{file.filename}' ({rows} rows, {cols} columns).",
+            "message": f"Successfully evaluated '{file.filename}' ({rows} rows, {cols} columns).",
             "columns": list(df.columns),
-            "sample_head": df.head(3).to_dict(orient="records")
+            "total_records": rows,
+            "avg_risk_percentage": round(avg_risk, 1),
+            "max_risk_percentage": round(max_risk, 1),
+            "safe_records": safe_count,
+            "warning_records": warn_count,
+            "critical_records": crit_count,
+            "top_risk_driver": top_driver
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid CSV file format: {str(e)}")
