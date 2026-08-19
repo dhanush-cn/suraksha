@@ -111,6 +111,19 @@ def log_alert(mine_id, risk_percentage, risk_level, rainfall_mm, pore_pressure_k
     finally:
         conn.close()
 
+def delete_mine(mine_id):
+    """Delete a mine and its associated alert history. Returns True if a row was removed."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM alert_logs WHERE mine_id = ?", (mine_id,))
+        cursor.execute("DELETE FROM mines WHERE id = ?", (mine_id,))
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
 def get_recent_alerts(limit=50):
     conn = get_db_connection()
     try:

@@ -1,18 +1,35 @@
 import os
+
+# app.core.config.Settings requires JWT_SECRET / DATABASE_URL with no
+# built-in defaults (by design -- a production deployment must set them
+# explicitly). These `setdefault` calls only fill them in for local/dev
+# runs that haven't; a real deployment's environment always wins.
+os.environ.setdefault("JWT_SECRET", "rockfallguard-dev-only-insecure-jwt-secret-do-not-use-in-prod")
+os.environ.setdefault("DATABASE_URL", "sqlite:///./mines.db")
+
 import numpy as np
 import shutil
 import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
-from database import init_db, register_mine, get_all_mines, log_alert, get_recent_alerts
+from database import init_db, register_mine, get_all_mines, delete_mine, log_alert, get_recent_alerts
 from weather_service import fetch_open_meteo_weather
 from ml_engine import predict_rockfall_risk
 from simulator import simulator_instance
 from cv_engine import analyze_drone_pit_image
+from redis_service import redis_service
+from app.schemas.auth import Principal
+from auth import (
+    authenticate_user,
+    enforce_admin_only,
+    enforce_tenant_access,
+    get_current_principal,
+    issue_login_tokens,
+)
 
 app = FastAPI(
     title="RockfallGuard - Open-Pit Mine Geological Risk Warning API",
@@ -29,7 +46,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Database on Startup
+# Initialize the database eagerly at import time (not only via the startup
+# event): init_db() is idempotent (CREATE TABLE IF NOT EXISTS), and
+# starlette's TestClient only runs lifespan/startup handlers when used as a
+# context manager (`with TestClient(app) as client`). backend/tests/test_app.py
+# instantiates TestClient at module scope without one, so relying solely on
+# the startup event left the schema uncreated under pytest.
+init_db()
+
 @app.on_event("startup")
 def on_startup():
     init_db()
@@ -58,15 +82,30 @@ class TelemetryPredictionRequest(BaseModel):
     raw_seismic_rms_g: float = 0.02
     rain_rolling_6h: Optional[float] = None
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
 # --- API ENDPOINTS ---
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "online", "system": "RockfallGuard Proactive Slope Stability Engine"}
+    return {
+        "status": "online",
+        "system": "RockfallGuard Proactive Slope Stability Engine",
+        "redis_connected": redis_service.is_connected(),
+    }
+
+# 0. Authentication
+@app.post("/api/auth/login")
+def login(req: LoginRequest):
+    user = authenticate_user(req.username, req.password)
+    return issue_login_tokens(user)
 
 # 1. Mine Registration & Management
 @app.post("/api/mines")
-def register_new_mine(req: MineRegistrationRequest):
+def register_new_mine(req: MineRegistrationRequest, principal: Principal = Depends(get_current_principal)):
+    enforce_admin_only(principal)
     try:
         mine_id = register_mine(
             name=req.name,
@@ -89,6 +128,14 @@ def register_new_mine(req: MineRegistrationRequest):
 @app.get("/api/mines")
 def list_mines():
     return get_all_mines()
+
+@app.delete("/api/mines/{mine_id}")
+def remove_mine(mine_id: int, principal: Principal = Depends(get_current_principal)):
+    enforce_admin_only(principal)
+    deleted = delete_mine(mine_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Mine ID {mine_id} not found.")
+    return {"status": "success", "message": f"Mine ID {mine_id} deleted."}
 
 # 2. Real-Time Open-Meteo Weather Integration
 @app.get("/api/weather/{lat}/{lon}")
@@ -119,7 +166,8 @@ def predict_hazard(req: TelemetryPredictionRequest):
 
 # 4. Stream Combined Live Telemetry + Weather + Risk Prediction
 @app.get("/api/telemetry/{mine_id}")
-def get_mine_live_telemetry(mine_id: int, scenario: str = Query("normal")):
+def get_mine_live_telemetry(mine_id: int, scenario: str = Query("normal"), principal: Principal = Depends(get_current_principal)):
+    enforce_tenant_access(principal, mine_id)
     mines = get_all_mines()
     target_mine = next((m for m in mines if m["id"] == mine_id), None)
     if not target_mine:
