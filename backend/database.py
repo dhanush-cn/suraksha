@@ -62,57 +62,69 @@ def init_db():
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, default_mines)
         
+    # Index matching the get_recent_alerts access pattern: filter/join on
+    # mine_id, order by triggered_at. Without it every alert query is a scan.
+    cursor.execute("""
+    CREATE INDEX IF NOT EXISTS idx_alert_logs_mine_triggered
+    ON alert_logs (mine_id, triggered_at DESC);
+    """)
+
     conn.commit()
     conn.close()
     print("[+] Database initialized successfully at:", DB_PATH)
 
 def register_mine(name, company, location_name, latitude, longitude, pit_depth_m, slope_angle_deg, contact_email, contact_phone, alert_threshold_pct=70.0):
     conn = get_db_connection()
-    cursor = conn.cursor()
     try:
+        cursor = conn.cursor()
         cursor.execute("""
         INSERT INTO mines (name, company, location_name, latitude, longitude, pit_depth_m, slope_angle_deg, contact_email, contact_phone, alert_threshold_pct)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (name, company, location_name, latitude, longitude, pit_depth_m, slope_angle_deg, contact_email, contact_phone, alert_threshold_pct))
         conn.commit()
-        mine_id = cursor.lastrowid
-        conn.close()
-        return mine_id
+        return cursor.lastrowid
     except sqlite3.IntegrityError:
-        conn.close()
         raise ValueError(f"A mine named '{name}' is already registered.")
+    finally:
+        # finally, not per-branch: any other exception previously leaked the
+        # connection, and SQLite holds a file lock until it is closed.
+        conn.close()
 
 def get_all_mines():
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM mines ORDER BY name ASC")
-    mines = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return mines
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM mines ORDER BY name ASC")
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
 
 def log_alert(mine_id, risk_percentage, risk_level, rainfall_mm, pore_pressure_kpa, velocity_mm_h, seismic_rms_g, top_shap_reason):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    INSERT INTO alert_logs (mine_id, risk_percentage, risk_level, rainfall_mm, pore_pressure_kpa, velocity_mm_h, seismic_rms_g, top_shap_reason)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (mine_id, risk_percentage, risk_level, rainfall_mm, pore_pressure_kpa, velocity_mm_h, seismic_rms_g, top_shap_reason))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT INTO alert_logs (mine_id, risk_percentage, risk_level, rainfall_mm, pore_pressure_kpa, velocity_mm_h, seismic_rms_g, top_shap_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (mine_id, risk_percentage, risk_level, rainfall_mm, pore_pressure_kpa, velocity_mm_h, seismic_rms_g, top_shap_reason))
+        conn.commit()
+    finally:
+        conn.close()
 
 def get_recent_alerts(limit=50):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    SELECT a.*, m.name as mine_name, m.company
-    FROM alert_logs a
-    JOIN mines m ON a.mine_id = m.id
-    ORDER BY a.triggered_at DESC
-    LIMIT ?
-    """, (limit,))
-    alerts = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return alerts
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT a.*, m.name as mine_name, m.company
+        FROM alert_logs a
+        JOIN mines m ON a.mine_id = m.id
+        ORDER BY a.triggered_at DESC
+        LIMIT ?
+        """, (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     init_db()
