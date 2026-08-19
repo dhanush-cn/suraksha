@@ -1,0 +1,1 @@
+"""Framework-agnostic foundations: config, logging, security, errors, middleware."""

@@ -8,3 +8,8 @@ __pycache__/
 .env
 .idea/
 .vscode/
+models/*.joblib
+models/*.pkl
+models/*.pth
+models/metrics.json
+data/*.csv
