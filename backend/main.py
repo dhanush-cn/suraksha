@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import shutil
 import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
