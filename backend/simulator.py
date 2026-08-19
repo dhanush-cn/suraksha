@@ -7,9 +7,21 @@ class SensorSimulator:
         self.cumulative_disp = 12.4 # mm
         self.last_time = time.time()
         
-    def generate_telemetry_frame(self, scenario: str = "normal", weather_data: Dict[str, Any] = None) -> Dict[str, Any]:
+    def generate_telemetry_frame(
+        self,
+        scenario: str = "normal",
+        weather_data: Dict[str, Any] = None,
+        mine_info: Dict[str, Any] = None,
+    ) -> Dict[str, Any]:
         """
         Generates realistic 1-second interval sensor telemetry based on chosen operational scenario.
+
+        Args:
+            scenario: One of "normal", "heavy_rain", "machinery_noise", "critical_failure".
+            weather_data: Live weather payload used to drive rainfall/humidity inputs.
+            mine_info: Registered mine record. Steeper slopes and deeper pits are
+                       inherently less stable, so pit geometry scales the baseline
+                       pore pressure and creep velocity.
         """
         # Default base weather if not provided
         if not weather_data:
@@ -54,9 +66,23 @@ class SensorSimulator:
             pore_pressure = 40.0
             raw_seismic = 0.02
 
+        # Scale by pit geometry when a registered mine is supplied. A 60-degree
+        # slope is materially less stable than a 30-degree one, so a shared
+        # baseline across every mine would be physically wrong.
+        # Applied BEFORE displacement accumulates, otherwise the reported
+        # velocity would not be the one that produced the reported displacement.
+        if mine_info:
+            slope_angle = float(mine_info.get("slope_angle_deg") or 45.0)
+            pit_depth = float(mine_info.get("pit_depth_m") or 150.0)
+            # Normalised around the 45-degree / 150 m reference case.
+            slope_factor = max(0.5, min(2.0, slope_angle / 45.0))
+            depth_factor = max(0.8, min(1.6, 1.0 + (pit_depth - 150.0) / 1500.0))
+            pore_pressure *= slope_factor
+            velocity *= slope_factor * depth_factor
+
         # Increment displacement
         self.cumulative_disp += (velocity * (1.0 / 3600.0)) # mm increment per sec
-        
+
         return {
             "scenario": scenario,
             "rainfall_mm": float(np.round(rain, 2)),
