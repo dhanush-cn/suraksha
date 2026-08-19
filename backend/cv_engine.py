@@ -42,18 +42,24 @@ class PitWallCNN(nn.Module):
         return out
 
 _CNN_MODEL = None
+_CNN_TRAINED = False
 
 def get_cnn_model():
-    global _CNN_MODEL
+    global _CNN_MODEL, _CNN_TRAINED
     if _CNN_MODEL is None:
         model = PitWallCNN()
         weights_path = os.path.join(MODELS_DIR, "drone_cnn_model.pth")
         if os.path.exists(weights_path):
             try:
-                model.load_state_dict(torch.load(weights_path, map_location=torch.device('cpu')))
-                print(f"[+] Loaded trained PyTorch CNN weights from {weights_path}")
+                model.load_state_dict(
+                    torch.load(weights_path, map_location="cpu", weights_only=True)
+                )
+                _CNN_TRAINED = True
+                print(f"[+] Loaded trained CNN weights from {weights_path}")
             except Exception as e:
-                print(f"[!] Could not load PyTorch weights ({e}), using initialized CNN.")
+                print(f"[!] Could not load weights ({e}); CNN is UNTRAINED")
+        else:
+            print("[!] No CNN weights found; CNN output is UNTRAINED and not meaningful")
         model.eval()
         _CNN_MODEL = model
     return _CNN_MODEL
@@ -105,7 +111,11 @@ def analyze_drone_pit_image(image_bytes: bytes) -> Dict[str, Any]:
             "crack_severity": crack_severity,
             "edge_gradient_intensity": float(np.round(edge_intensity, 2)),
             "recommendation": recommendation,
-            "cnn_architecture": "PyTorch PitWallCNN (Trained on Kaggle Drone Dataset)"
+            "cnn_architecture": (
+                "PyTorch PitWallCNN (trained)" if _CNN_TRAINED
+                else "PyTorch PitWallCNN (UNTRAINED — output is not meaningful)"
+            ),
+            "cnn_trained": _CNN_TRAINED
         }
         
     except Exception as e:
