@@ -7,22 +7,27 @@ import os
 os.environ.setdefault("JWT_SECRET", "rockfallguard-dev-only-insecure-jwt-secret-do-not-use-in-prod")
 os.environ.setdefault("DATABASE_URL", "sqlite:///./mines.db")
 
-import numpy as np
+import json
 import shutil
-import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Query
-from fastapi.staticfiles import StaticFiles
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
 
 from database import init_db, register_mine, get_all_mines, delete_mine, log_alert, get_recent_alerts
 from weather_service import fetch_open_meteo_weather
 from ml_engine import predict_rockfall_risk
 from simulator import simulator_instance
-from cv_engine import analyze_drone_pit_image
 from redis_service import redis_service
 from app.schemas.auth import Principal
+from app.schemas.alert import AlertCreate
+from app.schemas.telemetry import RiskLevel
+from app.workers.queue import enqueue, get_pool, job_status
+from app.workers.tasks import DEAD_LETTER_KEY, DEAD_LETTER_MAX_ENTRIES
 from auth import (
     authenticate_user,
     enforce_admin_only,
@@ -139,8 +144,8 @@ def remove_mine(mine_id: int, principal: Principal = Depends(get_current_princip
 
 # 2. Real-Time Open-Meteo Weather Integration
 @app.get("/api/weather/{lat}/{lon}")
-def get_live_weather(lat: float, lon: float):
-    return fetch_open_meteo_weather(lat, lon)
+async def get_live_weather(lat: float, lon: float):
+    return await fetch_open_meteo_weather(lat, lon)
 
 # 3. Predict Hazard Risk & SHAP Explanations
 @app.post("/api/predict_risk")
@@ -166,7 +171,7 @@ def predict_hazard(req: TelemetryPredictionRequest):
 
 # 4. Stream Combined Live Telemetry + Weather + Risk Prediction
 @app.get("/api/telemetry/{mine_id}")
-def get_mine_live_telemetry(mine_id: int, scenario: str = Query("normal"), principal: Principal = Depends(get_current_principal)):
+async def get_mine_live_telemetry(mine_id: int, scenario: str = Query("normal"), principal: Principal = Depends(get_current_principal)):
     enforce_tenant_access(principal, mine_id)
     mines = get_all_mines()
     target_mine = next((m for m in mines if m["id"] == mine_id), None)
@@ -174,22 +179,24 @@ def get_mine_live_telemetry(mine_id: int, scenario: str = Query("normal"), princ
         target_mine = mines[0] if mines else {
             "id": 1, "name": "Default Open Pit Mine", "latitude": -4.05, "longitude": 137.11, "alert_threshold_pct": 70.0
         }
-        
-    # Fetch real live weather for mine GPS coordinates
-    weather = fetch_open_meteo_weather(target_mine["latitude"], target_mine["longitude"])
-    
+
+    # Fetch real live weather for mine GPS coordinates (async httpx: does
+    # not block the event loop while Open-Meteo answers)
+    weather = await fetch_open_meteo_weather(target_mine["latitude"], target_mine["longitude"])
+
     # Generate sensor telemetry frame for specific mine
     telemetry = simulator_instance.generate_telemetry_frame(scenario=scenario, weather_data=weather, mine_info=target_mine)
-    
+
     # Run ML Inference
     prediction_input = {**telemetry, "mine_id": mine_id}
     prediction = predict_rockfall_risk(prediction_input)
-    
+
     # Auto log alert if risk exceeds mine threshold (e.g. >60-80%)
     alert_threshold = target_mine.get("alert_threshold_pct", 70.0)
     risk_pct = prediction["risk_percentage"]
     is_alert_triggered = risk_pct >= alert_threshold
-    
+
+    dispatch_job_id: Optional[str] = None
     if is_alert_triggered:
         top_reason = prediction["shap_explanations"][0]["explanation"] if prediction["shap_explanations"] else "Accelerating Displacement Rate"
         log_alert(
@@ -202,14 +209,44 @@ def get_mine_live_telemetry(mine_id: int, scenario: str = Query("normal"), princ
             seismic_rms_g=telemetry["raw_seismic_rms_g"],
             top_shap_reason=top_reason
         )
-        
+
+        # Enqueue emergency dispatch (email + SMS) to the worker. Derive
+        # the idempotency_key via AlertCreate so re-triggering the same
+        # alert within one minute (e.g., duplicate telemetry frames)
+        # dedupes at the worker via Redis SET NX. If the queue is down,
+        # enqueue() returns None -- the alert is still persisted in the
+        # DB, and ops can re-drive from get_recent_alerts().
+        alert_model = AlertCreate(
+            mine_id=mine_id,
+            risk_percentage=risk_pct,
+            risk_level=RiskLevel(prediction["risk_level"].lower()),
+            rainfall_mm=telemetry["rainfall_mm"],
+            pore_pressure_kpa=telemetry["pore_pressure_kpa"],
+            velocity_mm_h=telemetry["velocity_mm_h"],
+            seismic_rms_g=telemetry["raw_seismic_rms_g"],
+            top_shap_reason=top_reason,
+            triggered_at=datetime.now(timezone.utc),
+        )
+        dispatch_payload = {
+            "idempotency_key": alert_model.idempotency_key,
+            "mine_id": mine_id,
+            "mine_name": target_mine.get("name", f"Mine #{mine_id}"),
+            "risk_percentage": risk_pct,
+            "risk_level": prediction["risk_level"],
+            "top_shap_reason": top_reason,
+            "contact_email": target_mine.get("contact_email"),
+            "contact_phone": target_mine.get("contact_phone"),
+        }
+        dispatch_job_id = await enqueue("dispatch_alert", dispatch_payload)
+
     return {
         "mine": target_mine,
         "weather": weather,
         "telemetry": telemetry,
         "prediction": prediction,
         "alert_triggered": is_alert_triggered,
-        "alert_threshold_pct": alert_threshold
+        "alert_threshold_pct": alert_threshold,
+        "dispatch_job_id": dispatch_job_id,
     }
 
 # 5. Alert History Endpoint
@@ -217,77 +254,103 @@ def get_mine_live_telemetry(mine_id: int, scenario: str = Query("normal"), princ
 def fetch_alerts():
     return get_recent_alerts(limit=50)
 
+# Directory the API uses for uploads that get processed by the worker.
+# Worker pods must be able to read this path (shared volume in prod).
+_UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "../data/uploads")
+
 # 6. Upload Custom CSV Dataset for Retraining / Validation
-@app.post("/api/upload_csv")
+#
+# Enqueued to the arq worker rather than run inline: the previous
+# implementation ran df.iterrows() through predict_rockfall_risk
+# synchronously inside an async endpoint, so a 10k-row upload froze the
+# entire FastAPI event loop until it finished. Now the endpoint returns
+# 202 with a job_id the client polls at GET /api/jobs/{job_id}.
+@app.post("/api/upload_csv", status_code=202)
 async def upload_custom_dataset(file: UploadFile = File(...)):
-    if not file.filename.endswith(".csv"):
+    if not file.filename or not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
-        
-    upload_dir = os.path.join(os.path.dirname(__file__), "../data")
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, "custom_mine_upload.csv")
-    
+
+    os.makedirs(_UPLOAD_DIR, exist_ok=True)
+    # Per-upload filename: prevents two concurrent uploads from clobbering
+    # each other, and lets the worker read the exact bytes it was queued
+    # for even if another upload lands in the meantime.
+    file_path = os.path.join(_UPLOAD_DIR, f"csv_{uuid.uuid4().hex}.csv")
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-        
-    try:
-        df = pd.read_csv(file_path)
-        rows, cols = df.shape
-        
-        # Batch evaluate ML risk across rows
-        risk_scores = []
-        safe_count, warn_count, crit_count = 0, 0, 0
-        
-        for _, row in df.iterrows():
-            pred = predict_rockfall_risk(row.to_dict())
-            rp = pred["risk_percentage"]
-            risk_scores.append(rp)
-            if rp >= 65.0:
-                crit_count += 1
-            elif rp >= 35.0:
-                warn_count += 1
-            else:
-                safe_count += 1
-                
-        avg_risk = float(np.mean(risk_scores)) if risk_scores else 0.0
-        max_risk = float(np.max(risk_scores)) if risk_scores else 0.0
-        
-        # Identify top physical driver from columns
-        top_driver = "Accelerated Creep Velocity"
-        if "pore_pressure_kpa" in df.columns and df["pore_pressure_kpa"].mean() > 50.0:
-            top_driver = "Pore Pressure & Hydro-Kinematic Saturation"
-        elif "rainfall_mm" in df.columns and df["rainfall_mm"].mean() > 10.0:
-            top_driver = "Monsoon Rainfall Intensity"
-            
-        return {
-            "status": "success",
-            "message": f"Successfully evaluated '{file.filename}' ({rows} rows, {cols} columns).",
-            "columns": list(df.columns),
-            "total_records": rows,
-            "avg_risk_percentage": round(avg_risk, 1),
-            "max_risk_percentage": round(max_risk, 1),
-            "safe_records": safe_count,
-            "warning_records": warn_count,
-            "critical_records": crit_count,
-            "top_risk_driver": top_driver
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid CSV file format: {str(e)}")
+
+    # max_tries=1 for score_csv is set per-function in WorkerSettings;
+    # CSV scoring is deterministic and retrying a corrupt input just
+    # wastes worker capacity.
+    job_id = await enqueue("score_csv", file_path, file.filename)
+    if job_id is None:
+        raise HTTPException(status_code=503, detail="Background queue unavailable; try again shortly.")
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "poll_url": f"/api/jobs/{job_id}",
+        "filename": file.filename,
+    }
 
 # 7. Drone UAV Bench Wall PyTorch CNN Image Analysis Endpoint
-@app.api_route("/api/analyze_drone_image", methods=["GET", "POST"])
-@app.api_route("/api/analyze_drone_image/", methods=["GET", "POST"])
+#
+# Same rationale as /api/upload_csv: the torch forward pass is CPU-bound
+# work that must not run in the request path.
+@app.api_route("/api/analyze_drone_image", methods=["GET", "POST"], status_code=202)
+@app.api_route("/api/analyze_drone_image/", methods=["GET", "POST"], status_code=202)
 async def analyze_drone_image_endpoint(file: Optional[UploadFile] = File(None)):
     if file is None:
         raise HTTPException(status_code=400, detail="Please select an image file to upload.")
-    try:
-        contents = await file.read()
-        if not contents or len(contents) < 10:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-        results = analyze_drone_pit_image(contents)
-        return results
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Image processing error: {str(e)}")
+    contents = await file.read()
+    if not contents or len(contents) < 10:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    os.makedirs(_UPLOAD_DIR, exist_ok=True)
+    image_path = os.path.join(_UPLOAD_DIR, f"img_{uuid.uuid4().hex}.bin")
+    with open(image_path, "wb") as buffer:
+        buffer.write(contents)
+
+    # max_tries=1 for analyze_image is set per-function in WorkerSettings.
+    job_id = await enqueue("analyze_image", image_path)
+    if job_id is None:
+        raise HTTPException(status_code=503, detail="Background queue unavailable; try again shortly.")
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "poll_url": f"/api/jobs/{job_id}",
+        "filename": file.filename,
+    }
+
+# 8. Job Status Polling
+#
+# Clients hit this to check whether a background job (score_csv,
+# analyze_image, dispatch_alert) has completed and to read its result.
+@app.get("/api/jobs/{job_id}")
+async def get_job_status(job_id: str, principal: Principal = Depends(get_current_principal)):
+    return await job_status(job_id)
+
+# 9. Dead-Letter Queue Inspection (admin only)
+#
+# The dispatch worker LPUSHes failed alert deliveries here after the
+# retry cap. Ops can inspect and re-drive, so nothing gets silently
+# dropped the way the old sync notification code did.
+@app.get("/api/dispatch/dead_letter")
+async def get_dispatch_dead_letter(
+    limit: int = Query(50, ge=1, le=DEAD_LETTER_MAX_ENTRIES),
+    principal: Principal = Depends(get_current_principal),
+):
+    enforce_admin_only(principal)
+    pool = await get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Background queue unavailable.")
+    raw_entries = await pool.lrange(DEAD_LETTER_KEY, 0, limit - 1)
+    entries: List[Dict[str, Any]] = []
+    for raw in raw_entries:
+        try:
+            entries.append(json.loads(raw))
+        except (ValueError, TypeError):
+            # A malformed entry should not poison the whole response.
+            entries.append({"raw": str(raw), "parse_error": True})
+    return {"count": len(entries), "entries": entries}
 
 # Mount Frontend Dashboard Static Directory
 frontend_dir = os.path.join(os.path.dirname(__file__), "../frontend")
