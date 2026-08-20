@@ -32,3 +32,4 @@ structlog==26.1.0
 
 pytest==8.3.4
 httpx==0.28.1
+fakeredis[lua]==2.37.1  # verify_redis.py smoke tests (dev/test only)

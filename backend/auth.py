@@ -138,7 +138,7 @@ def issue_login_tokens(user: _SeedUser) -> dict:
 # --------------------------------------------------------------------------
 
 
-def get_current_principal(token: Optional[str] = Depends(oauth2_scheme)) -> Principal:
+async def get_current_principal(token: Optional[str] = Depends(oauth2_scheme)) -> Principal:
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -154,6 +154,14 @@ def get_current_principal(token: Optional[str] = Depends(oauth2_scheme)) -> Prin
             detail=exc.message,
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+
+    # Revocation check AFTER signature/expiry -- there's no point
+    # asking the blocklist about a token we've already rejected. Fails
+    # closed (raises 401) if Redis is unreachable; see
+    # :mod:`app.core.blocklist` for the rationale.
+    from app.core.blocklist import ensure_not_revoked
+
+    await ensure_not_revoked(claims["jti"])
     return Principal.from_claims(claims)
 
 

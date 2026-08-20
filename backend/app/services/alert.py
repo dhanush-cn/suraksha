@@ -21,6 +21,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.streams import publish_emergency_event
 from app.db.models import Mine
 from app.repositories.alert import AlertRepository
 from app.schemas.alert import AlertCreate
@@ -123,7 +124,16 @@ class AlertService:
             "contact_email": mine.contact_email,
             "contact_phone": mine.contact_phone,
         }
-        return await enqueue("dispatch_alert", payload)
+        job_id = await enqueue("dispatch_alert", payload)
+
+        # Emit to the emergency stream too: durable, replay-able,
+        # consumed by downstream analytics / WebSocket bridge /
+        # external monitoring. Replaces the old pub/sub channel that
+        # silently dropped messages when nothing was subscribed.
+        # Non-fatal on failure -- the alert row is already in the DB
+        # and the worker was still enqueued.
+        await publish_emergency_event({**payload, "dispatch_job_id": job_id})
+        return job_id
 
 
 __all__ = ["AlertService", "DEFAULT_THRESHOLD_PCT", "TelemetryFrame"]

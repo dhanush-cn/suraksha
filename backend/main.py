@@ -58,7 +58,12 @@ from app.api.deps import (
     get_mine_service,
     get_risk_service,
 )
+from app.core.blocklist import blocklist_size, revoke
+from app.core.cache import cache_stats
 from app.core.exceptions import AppError
+from app.core.rate_limit import rate_limit_predict_risk, rate_limit_upload_csv
+from app.core.security import decode_token, revocation_ttl_seconds
+from app.core.streams import recent_events, stream_length
 from app.db.models import Mine
 from app.schemas.auth import Principal
 from app.services import AlertService, AuthService, MineService, RiskService
@@ -68,9 +73,10 @@ from auth import (
     enforce_admin_only,
     enforce_tenant_access,
     get_current_principal,
+    oauth2_scheme,
 )
+from app.core.redis_client import get_redis
 from database import init_db, get_recent_alerts  # still writes/reads the same SQLite file
-from redis_service import redis_service
 from simulator import simulator_instance
 from weather_service import fetch_open_meteo_weather
 
@@ -177,11 +183,15 @@ def _mine_to_dict(mine: Mine) -> Dict[str, Any]:
 
 
 @app.get("/api/health")
-def health_check() -> Dict[str, Any]:
+async def health_check() -> Dict[str, Any]:
+    # Uses the async client (same pool everything else uses) instead
+    # of maintaining a parallel sync client just for the healthcheck.
+    # Absent client -> not connected; short-circuits before ping().
+    redis_client = await get_redis()
     return {
         "status": "online",
         "system": "RockfallGuard Proactive Slope Stability Engine",
-        "redis_connected": redis_service.is_connected(),
+        "redis_connected": redis_client is not None,
     }
 
 
@@ -201,6 +211,43 @@ def login(req: LoginRequest, auth: AuthService = Depends(get_auth_service)) -> D
             "company_name": result.company_name,
         },
     }
+
+
+# 0b. Logout -- adds the caller's jti to the Redis blocklist for its
+# remaining lifetime. The next request bearing the same token gets 401.
+# Uses raw ``oauth2_scheme`` (not get_current_principal) so we still
+# reach the revoke path even if the token is already blocklisted --
+# double-logout is idempotent, not an error.
+@app.post("/api/auth/logout")
+async def logout(token: Optional[str] = Depends(oauth2_scheme)) -> Dict[str, Any]:
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    from app.core.config import get_settings
+    from app.core.exceptions import TokenExpiredError, TokenInvalidError
+    from app.core.security import TokenType
+
+    try:
+        claims = decode_token(
+            token, settings=get_settings(), expected_type=TokenType.ACCESS
+        )
+    except (TokenExpiredError, TokenInvalidError):
+        # Already unusable; treat as successful revocation.
+        return {"status": "revoked"}
+
+    ttl = revocation_ttl_seconds(claims)
+    ok = await revoke(claims["jti"], ttl_seconds=ttl)
+    if not ok:
+        # Redis is down. Failing 200 here would be a lie -- the token
+        # is not actually revoked and would keep working elsewhere.
+        raise HTTPException(
+            status_code=503,
+            detail="Revocation service unavailable; token was NOT revoked. Retry when Redis is reachable.",
+        )
+    return {"status": "revoked", "expires_in_seconds": ttl}
 
 
 # 1. Mine Registration & Management
@@ -257,8 +304,8 @@ async def get_live_weather(lat: float, lon: float) -> Dict[str, Any]:
 # Used to hardcode ``if risk_pct >= 60.0`` -- diverged from the mine-
 # configured threshold. Now routes through AlertService.should_trigger,
 # so a single sensor frame produces the same alert decision regardless
-# of which endpoint saw it.
-@app.post("/api/predict_risk")
+# of which endpoint saw it. Rate limit: token bucket, per-IP.
+@app.post("/api/predict_risk", dependencies=[Depends(rate_limit_predict_risk)])
 async def predict_hazard(
     req: TelemetryPredictionRequest,
     mines: MineService = Depends(get_mine_service),
@@ -360,7 +407,13 @@ _UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "../data/uploads")
 #
 # Enqueued to the arq worker rather than run inline: a 10k-row upload
 # would otherwise freeze the entire event loop until scoring finished.
-@app.post("/api/upload_csv", status_code=202)
+# Rate limit: 5 uploads per burst, refill 1 / min per IP -- CSV
+# scoring is expensive, so the cap is intentionally strict.
+@app.post(
+    "/api/upload_csv",
+    status_code=202,
+    dependencies=[Depends(rate_limit_upload_csv)],
+)
 async def upload_custom_dataset(file: UploadFile = File(...)) -> Dict[str, Any]:
     if not file.filename or not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
@@ -439,6 +492,38 @@ async def get_dispatch_dead_letter(
         except (ValueError, TypeError):
             entries.append({"raw": str(raw), "parse_error": True})
     return {"count": len(entries), "entries": entries}
+
+
+# 10. Emergency Stream Inspection (admin)
+#
+# Reads recent entries from the Redis Stream that AlertService.dispatch
+# XADDs to on every triggered alert. Replaces the old pub/sub channel
+# that silently dropped messages when no subscriber was connected.
+@app.get("/api/emergency/events")
+async def get_emergency_events(
+    limit: int = Query(50, ge=1, le=500),
+    principal: Principal = Depends(get_current_principal),
+) -> Dict[str, Any]:
+    enforce_admin_only(principal)
+    events = await recent_events(limit=limit)
+    return {
+        "count": len(events),
+        "stream_length": await stream_length(),
+        "events": events,
+    }
+
+
+# 11. Cache + Blocklist Diagnostics (admin)
+@app.get("/api/ops/diagnostics")
+async def get_ops_diagnostics(
+    principal: Principal = Depends(get_current_principal),
+) -> Dict[str, Any]:
+    enforce_admin_only(principal)
+    return {
+        "cache": await cache_stats(),
+        "blocklist_size": await blocklist_size(),
+        "emergency_stream_length": await stream_length(),
+    }
 
 
 # Mount Frontend Dashboard Static Directory
