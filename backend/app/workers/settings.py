@@ -40,6 +40,7 @@ from app.workers.tasks import (  # noqa: E402
     DISPATCH_MAX_TRIES,
     analyze_image,
     dispatch_alert,
+    embed_alert,
     score_csv,
 )
 
@@ -57,6 +58,11 @@ class WorkerSettings:
     functions = [
         func(score_csv, name="score_csv", max_tries=1),
         func(analyze_image, name="analyze_image", max_tries=1),
+        # RAG embedding is nice-to-have, not correctness-critical. A
+        # LLM outage that persists past one retry means we've burned
+        # more tokens than the embedding is worth to keep. The chat
+        # endpoint's retrieval fallback covers a missing row.
+        func(embed_alert, name="embed_alert", max_tries=1),
         dispatch_alert,
     ]
 

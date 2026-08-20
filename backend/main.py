@@ -55,6 +55,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import (
     get_alert_service,
     get_auth_service,
+    get_chat_service,
     get_mine_service,
     get_risk_service,
 )
@@ -70,6 +71,7 @@ from app.core.security import decode_token, revocation_ttl_seconds
 from app.core.streams import recent_events, stream_length
 from app.db.models import Mine
 from app.schemas.auth import Principal
+from app.rag.service import ChatService
 from app.services import AlertService, AuthService, MineService, RiskService
 from app.workers.queue import enqueue, get_pool, job_status
 from app.workers.tasks import DEAD_LETTER_KEY, DEAD_LETTER_MAX_ENTRIES
@@ -219,6 +221,14 @@ class TelemetryPredictionRequest(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class ChatRequest(BaseModel):
+    # Cap the question size so an accidental large-paste doesn't
+    # trigger a giant embedding + a huge context window on the LLM.
+    # 4000 chars ~= 1000 tokens, way more than an operator question
+    # normally needs.
+    question: str = Field(..., min_length=1, max_length=4000)
 
 
 def _mine_to_dict(mine: Mine) -> Dict[str, Any]:
@@ -632,6 +642,32 @@ async def get_dispatch_dead_letter(
         except (ValueError, TypeError):
             entries.append({"raw": str(raw), "parse_error": True})
     return {"count": len(entries), "entries": entries}
+
+
+# 9b. RAG Chat (Alert QA) -- SSE streaming
+#
+# Uses the same token-bucket rate limiter as /api/predict_risk (LLM
+# calls are expensive) and requires authentication so we don't burn
+# tokens on unauthenticated traffic.
+@app.post("/api/chat", dependencies=[Depends(rate_limit_predict_risk)])
+async def rag_chat(
+    req: ChatRequest,
+    principal: Principal = Depends(get_current_principal),
+    chat: ChatService = Depends(get_chat_service),
+):
+    from fastapi.responses import StreamingResponse
+
+    return StreamingResponse(
+        chat.stream(req.question),
+        # text/event-stream so a browser EventSource / a curl -N works
+        # out of the box. X-Accel-Buffering off so an nginx reverse
+        # proxy in front doesn't buffer the stream and defeat the point.
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # 10. Emergency Stream Inspection (admin)

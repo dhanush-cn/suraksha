@@ -64,6 +64,32 @@ class Settings(BaseSettings):
     models_dir: str = "models"
     require_ml_artifacts: bool = True
 
+    # --- LLM / RAG (Step 8) -------------------------------------------------
+    # Any OpenAI-chat-compatible endpoint. Point at OpenAI, Anthropic's
+    # OpenAI-compat proxy, Groq, Together, or a local Ollama by changing
+    # the URL alone -- no code changes needed. Absent -> chat endpoint
+    # returns 503 with a config-required message rather than crashing.
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_api_key: SecretStr | None = None
+    llm_chat_model: str = "gpt-4o-mini"
+    llm_embedding_model: str = "text-embedding-3-small"
+    # Dimension MUST match llm_embedding_model. text-embedding-3-small = 1536;
+    # -large = 3072; Ollama nomic-embed-text = 768. Kept explicit so a
+    # model swap can't silently corrupt the pgvector index (which is
+    # dimension-typed).
+    llm_embedding_dim: Annotated[int, Field(ge=1, le=8_192)] = 1_536
+    llm_request_timeout_seconds: Annotated[float, Field(gt=0)] = 30.0
+    rag_top_k: Annotated[int, Field(ge=1, le=50)] = 5
+    # When True, /api/chat + the embedder require llm_api_key. When
+    # False (dev default), a missing key falls through to a
+    # "not configured" 503 without an exception. Turn on in production
+    # to fail loud at boot instead.
+    llm_required: bool = False
+
+    @property
+    def llm_enabled(self) -> bool:
+        return self.llm_api_key is not None
+
     @field_validator("cors_origins", "trusted_hosts", mode="before")
     @classmethod
     def _split_csv(cls, value: Any) -> Any:

@@ -1,0 +1,54 @@
+# Local-dev services for RAG + workers + the async DB path.
+#
+# Starts a Postgres with pgvector preinstalled and a Redis. The API +
+# arq worker still run on your host so hot-reload works; the compose
+# is just for the two stateful backing services.
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up -d
+#   cd backend && alembic upgrade head          # creates schema + pgvector extension
+#   cd backend && python -m uvicorn main:app --reload --port 8005
+#   cd backend && arq app.workers.settings.WorkerSettings    # in a second shell
+#
+# Tear down (keeps volumes):
+#   docker compose -f docker-compose.dev.yml down
+# Nuke state too:
+#   docker compose -f docker-compose.dev.yml down -v
+
+services:
+  postgres:
+    # pgvector's official image = official postgres + the extension
+    # baked in. `pg16` gives us the latest general-availability major
+    # (matches what a fresh managed Postgres would give you today).
+    image: pgvector/pgvector:pg16
+    container_name: rockfallguard-postgres
+    environment:
+      POSTGRES_USER: rockfallguard
+      POSTGRES_PASSWORD: rockfallguard
+      POSTGRES_DB: rockfallguard
+    ports:
+      - "5432:5432"
+    volumes:
+      - rockfallguard_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rockfallguard -d rockfallguard"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: rockfallguard-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - rockfallguard_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  rockfallguard_pg_data:
+  rockfallguard_redis_data:

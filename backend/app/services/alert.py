@@ -76,8 +76,13 @@ class AlertService:
         for the dispatch payload appears in the audit row -- keeps
         "what did we tell the operator?" and "what did we log?" in
         sync.
+
+        Also fires an ``embed_alert`` job so the new alert becomes
+        searchable via RAG chat within seconds. Best-effort: an
+        embedding failure NEVER blocks the alert being recorded, since
+        the audit trail is the source of truth.
         """
-        await self._repo.log(
+        alert = await self._repo.log(
             mine_id=mine_id,
             risk_percentage=float(prediction["risk_percentage"]),
             risk_level=str(prediction["risk_level"]),
@@ -87,6 +92,10 @@ class AlertService:
             seismic_rms_g=telemetry.get("raw_seismic_rms_g"),
             top_shap_reason=top_reason,
         )
+        # Non-fatal enqueue: enqueue() returns None when Redis is
+        # down; the worker skips embedding on non-Postgres or missing
+        # LLM key. Either way the alert is already persisted.
+        await enqueue("embed_alert", int(alert.id))
 
     async def dispatch(
         self,

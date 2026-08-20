@@ -18,6 +18,7 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.engine import session_scope
+from app.rag.service import ChatService
 from app.services import AlertService, AuthService, MineService, RiskService
 
 
@@ -44,6 +45,18 @@ def get_risk_service() -> RiskService:
     return RiskService()
 
 
+async def get_chat_service(
+    session: AsyncSession = Depends(get_db_session),
+) -> ChatService:
+    """Per-request ChatService bound to the same session as MineService.
+
+    ChatService constructs its own LLMClient internally; we don't
+    inject one here because there's no cross-request state to share
+    (the httpx.AsyncClient is opened + closed per LLM call).
+    """
+    return ChatService(session)
+
+
 def get_auth_service() -> AuthService:
     """Wired to the in-process seed roster in :mod:`backend.auth`.
 
@@ -59,6 +72,7 @@ def get_auth_service() -> AuthService:
 __all__ = [
     "get_alert_service",
     "get_auth_service",
+    "get_chat_service",
     "get_db_session",
     "get_mine_service",
     "get_risk_service",

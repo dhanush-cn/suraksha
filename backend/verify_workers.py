@@ -316,12 +316,14 @@ def _():
         return entry.name if isinstance(entry, Function) else entry.__name__
 
     names = {_name(f) for f in WorkerSettings.functions}
-    assert names == {"score_csv", "analyze_image", "dispatch_alert"}, names
+    assert names == {"score_csv", "analyze_image", "dispatch_alert", "embed_alert"}, names
 
-    # Per-function overrides: max_tries=1 for the deterministic tasks.
+    # Per-function overrides: max_tries=1 for the deterministic tasks
+    # and for embed_alert (nice-to-have, not correctness-critical).
     by_name = {_name(f): f for f in WorkerSettings.functions}
     assert by_name["score_csv"].max_tries == 1
     assert by_name["analyze_image"].max_tries == 1
+    assert by_name["embed_alert"].max_tries == 1
 
     assert WorkerSettings.max_tries == DISPATCH_MAX_TRIES
     assert WorkerSettings.job_timeout == 300

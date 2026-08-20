@@ -42,6 +42,7 @@ import httpx
 from arq import Retry
 
 from app.core.metrics import record_dispatch_outcome
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +360,94 @@ async def _dead_letter(
     )
 
 
+# ---------------------------------------------------------------------------
+# 4. Alert embedding (RAG) -- runs when a new alert lands
+# ---------------------------------------------------------------------------
+
+
+async def embed_alert(ctx: dict[str, Any], alert_id: int) -> dict[str, Any]:
+    """Embed one alert's source_text and UPSERT into ``alert_embeddings``.
+
+    * Postgres-only. On SQLite the task returns a "skipped" result so
+      the worker's job log is clear about why nothing happened -- the
+      RAG feature requires pgvector and the app-level fallbacks handle
+      the "not available" UX at query time.
+    * Idempotent: rerunning the task overwrites the row rather than
+      duplicating. Safe under retry.
+    * LLM outage returns a "failed" result; the arq worker doesn't
+      retry (max_tries=1 for this function set in WorkerSettings) --
+      the embedding is a nice-to-have, not a correctness requirement,
+      and thrashing the LLM API on a persistent outage is expensive.
+    """
+    settings = get_settings()
+    if not settings.llm_enabled:
+        return {"status": "skipped", "reason": "LLM_API_KEY not configured"}
+
+    # Deferred imports so a SQLite-only run of unrelated worker
+    # functions doesn't pay for these (and doesn't import pgvector,
+    # which needs a Postgres driver on some code paths).
+    from sqlalchemy import text
+
+    from app.db.engine import session_scope
+    from app.db.models import AlertLog, Mine
+    from app.rag.client import LLMClient
+    from app.rag.embeddings import build_alert_source_text_from_row
+
+    async with session_scope() as session:
+        if session.bind.dialect.name != "postgresql":  # type: ignore[union-attr]
+            return {
+                "status": "skipped",
+                "reason": f"dialect is {session.bind.dialect.name if session.bind else 'unknown'}; RAG requires postgresql",
+            }
+
+        alert = await session.get(AlertLog, alert_id)
+        if alert is None:
+            return {"status": "error", "message": f"alert {alert_id} not found"}
+        # Load mine metadata for the source_text (joinedload isn't
+        # needed for a single-row fetch).
+        mine = await session.get(Mine, alert.mine_id)
+        alert.mine = mine  # attach for the shared source-text builder
+
+        source_text = build_alert_source_text_from_row(alert)
+        try:
+            embedding = await LLMClient().embed(source_text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("embed_alert failed for alert %s: %s", alert_id, exc)
+            return {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+
+        # UPSERT via ON CONFLICT so re-embedding after a model swap is
+        # idempotent -- the alert_id primary key ensures at most one
+        # embedding row per alert.
+        #
+        # Vector encoded as its pgvector string literal (``[1,2,3]``)
+        # then CAST -- avoids per-connection codec setup for asyncpg.
+        # See app/rag/retrieval.py::_to_vector_literal for the same
+        # pattern on the read path.
+        from app.rag.retrieval import _to_vector_literal
+
+        await session.execute(
+            text(
+                """
+                INSERT INTO alert_embeddings (alert_id, source_text, model, embedding, created_at)
+                VALUES (:alert_id, :source_text, :model, CAST(:embedding AS vector), CURRENT_TIMESTAMP)
+                ON CONFLICT (alert_id) DO UPDATE SET
+                    source_text = EXCLUDED.source_text,
+                    model = EXCLUDED.model,
+                    embedding = EXCLUDED.embedding,
+                    created_at = EXCLUDED.created_at
+                """
+            ),
+            {
+                "alert_id": alert_id,
+                "source_text": source_text,
+                "model": settings.llm_embedding_model,
+                "embedding": _to_vector_literal(embedding),
+            },
+        )
+
+    return {"status": "embedded", "alert_id": alert_id, "chars": len(source_text)}
+
+
 __all__ = [
     "DEAD_LETTER_KEY",
     "DEAD_LETTER_MAX_ENTRIES",
@@ -366,5 +455,6 @@ __all__ = [
     "IDEMPOTENCY_LOCK_TTL_SECONDS",
     "analyze_image",
     "dispatch_alert",
+    "embed_alert",
     "score_csv",
 ]
