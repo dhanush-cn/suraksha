@@ -26,6 +26,7 @@ import contextlib
 import logging
 from typing import AsyncIterator
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -86,7 +87,20 @@ def _build_engine() -> AsyncEngine:
         kwargs["pool_recycle"] = 1800
 
     logger.info("creating async engine for %s", dsn.split("://", 1)[0])
-    return create_async_engine(dsn, **kwargs)
+    engine = create_async_engine(dsn, **kwargs)
+
+    if dsn.startswith("sqlite"):
+        # SQLite doesn't enforce foreign keys unless PRAGMA foreign_keys=ON
+        # runs on each connection. Without this, ON DELETE CASCADE / SET
+        # NULL are silent no-ops -- schema-level intent that never fires,
+        # and dev/test behaviour diverges from production Postgres.
+        @event.listens_for(engine.sync_engine, "connect")
+        def _enable_sqlite_foreign_keys(dbapi_conn, _record):  # noqa: ARG001
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+    return engine
 
 
 def get_engine() -> AsyncEngine:
