@@ -293,14 +293,30 @@ function setupEventListeners() {
     document.getElementById("closeDroneModalBtn")?.addEventListener("click", () => droneModal?.classList.add("hidden"));
     document.getElementById("cancelDroneBtn")?.addEventListener("click", () => droneModal?.classList.add("hidden"));
 
+    // Render a "Selected File: <name> (<size> KB)" label without
+    // interpolating the (attacker-controlled) file name into an
+    // innerHTML string. The previous version was a DOM-XSS sink:
+    // uploading a file literally named `<img src=x onerror=alert(1)>`
+    // executed the payload as soon as the input changed. Building the
+    // nodes and setting textContent keeps the file name inert.
+    function renderSelectedFileLabel(textElem, file) {
+        textElem.textContent = "";
+        const label = document.createElement("strong");
+        label.textContent = "Selected File: ";
+        textElem.appendChild(label);
+        textElem.appendChild(document.createTextNode(
+            `${file.name} (${(file.size / 1024).toFixed(1)} KB)`
+        ));
+        textElem.style.color = "#3b82f6";
+    }
+
     // Display selected drone image filename on file input change
     const droneInputElem = document.getElementById("droneImageInput") || document.getElementById("droneFileInput");
     droneInputElem?.addEventListener("change", (e) => {
         const file = e.target.files[0];
         const textElem = document.querySelector("#droneModal .dropzone-text span:last-child");
         if (file && textElem) {
-            textElem.innerHTML = `<strong>Selected File:</strong> ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
-            textElem.style.color = "#3b82f6";
+            renderSelectedFileLabel(textElem, file);
         }
     });
 
@@ -309,8 +325,7 @@ function setupEventListeners() {
         const file = e.target.files[0];
         const textElem = document.querySelector("#uploadModal .dropzone-text span:last-child");
         if (file && textElem) {
-            textElem.innerHTML = `<strong>Selected File:</strong> ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
-            textElem.style.color = "#3b82f6";
+            renderSelectedFileLabel(textElem, file);
         }
     });
 

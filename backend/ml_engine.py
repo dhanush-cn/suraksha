@@ -1,9 +1,13 @@
+import logging
 import os
+from typing import Any, Dict, List
+
 import joblib
 import numpy as np
 import pandas as pd
 from scipy.signal import butter, filtfilt
-from typing import Dict, Any, List
+
+logger = logging.getLogger(__name__)
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "../models")
 
@@ -32,9 +36,12 @@ def load_ml_artifacts():
             _SCALER = joblib.load(os.path.join(MODELS_DIR, "scaler.joblib"))
             _EXPLAINER = joblib.load(os.path.join(MODELS_DIR, "shap_explainer.joblib"))
             _FEATURE_NAMES = joblib.load(os.path.join(MODELS_DIR, "feature_names.joblib"))
-            print("[+] ML artifacts loaded successfully.")
-        except Exception as e:
-            print(f"[!] Warning: Could not load ML artifacts ({e}). Training pipeline must run first.")
+            logger.info("ML artifacts loaded", extra={"models_dir": MODELS_DIR})
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "could not load ML artifacts; training pipeline must run first",
+                extra={"error": str(e), "models_dir": MODELS_DIR},
+            )
 
 def predict_rockfall_risk(sensor_input: Dict[str, Any]) -> Dict[str, Any]:
     load_ml_artifacts()
@@ -132,7 +139,7 @@ def predict_rockfall_risk(sensor_input: Dict[str, Any]) -> Dict[str, Any]:
                 "explanation": f"{direction} {readable} (Impact: {impact_val:+.2f})"
             })
     except Exception as e:
-        print("[!] SHAP explanation error:", e)
+        logger.warning("SHAP explanation failed; using default reason", extra={"error": str(e)})
         shap_reasons = [{"feature": "velocity_mm_h", "readable_name": "Displacement Velocity", "impact_score": 0.5, "explanation": "Displacement velocity rate"}]
         
     return {

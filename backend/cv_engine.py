@@ -1,10 +1,14 @@
-import os
 import io
+import logging
+import os
+from typing import Any, Dict
+
+import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-import numpy as np
-from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "../models")
 
@@ -55,11 +59,11 @@ def get_cnn_model():
                     torch.load(weights_path, map_location="cpu", weights_only=True)
                 )
                 _CNN_TRAINED = True
-                print(f"[+] Loaded trained CNN weights from {weights_path}")
-            except Exception as e:
-                print(f"[!] Could not load weights ({e}); CNN is UNTRAINED")
+                logger.info("loaded trained CNN weights", extra={"weights_path": weights_path})
+            except Exception as e:  # noqa: BLE001
+                logger.warning("could not load CNN weights; running UNTRAINED", extra={"error": str(e)})
         else:
-            print("[!] No CNN weights found; CNN output is UNTRAINED and not meaningful")
+            logger.warning("no CNN weights found; CNN output is UNTRAINED and not meaningful")
         model.eval()
         _CNN_MODEL = model
     return _CNN_MODEL
@@ -69,17 +73,22 @@ def analyze_drone_pit_image(image_bytes: bytes) -> Dict[str, Any]:
     Processes an aerial drone/UAV image of an open-pit mine wall using PyTorch CNN.
     Detects surface crack propagation, bench slope displacement anomalies, and returns visual risk score (0-100%).
     """
+    # Deferred import so the metrics dep doesn't leak into environments
+    # that only run cv_engine standalone (e.g. the file's ``__main__``
+    # smoke test).
+    from app.core.metrics import observe_cv_inference
+
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         image_resized = image.resize((224, 224))
         img_np = np.array(image_resized, dtype=np.float32) / 255.0
-        
+
         # Standard PyTorch normalization
         img_tensor = torch.tensor(img_np).permute(2, 0, 1).unsqueeze(0)
-        
-        # Run CNN Forward Pass
+
+        # Run CNN Forward Pass -- timed for the Prometheus histogram.
         cnn_model = get_cnn_model()
-        with torch.no_grad():
+        with observe_cv_inference(), torch.no_grad():
             raw_cnn_score = float(cnn_model(img_tensor).item())
             
         # High-frequency edge gradient variance (detects tension cracks vs smooth rock face)
@@ -118,12 +127,12 @@ def analyze_drone_pit_image(image_bytes: bytes) -> Dict[str, Any]:
             "cnn_trained": _CNN_TRAINED
         }
         
-    except Exception as e:
-        print("[!] Drone image CNN analysis error:", e)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("drone image CNN analysis failed", extra={"error": str(e)})
         return {
             "status": "error",
             "message": f"Failed to analyze image: {str(e)}",
-            "visual_risk_percentage": 0.0
+            "visual_risk_percentage": 0.0,
         }
 
 if __name__ == "__main__":

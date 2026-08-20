@@ -41,6 +41,8 @@ from typing import Any
 import httpx
 from arq import Retry
 
+from app.core.metrics import record_dispatch_outcome
+
 logger = logging.getLogger(__name__)
 
 # --- Dispatch retry policy ---
@@ -76,6 +78,8 @@ def _score_csv_sync(file_path: str, filename: str) -> dict[str, Any]:
     import numpy as np
     import pandas as pd
 
+    from app.core.config import get_settings
+
     # Imported lazily: keeps the worker start-up light and avoids paying
     # ml_engine's model-load cost until the first CSV job actually runs.
     from ml_engine import predict_rockfall_risk
@@ -83,8 +87,20 @@ def _score_csv_sync(file_path: str, filename: str) -> dict[str, Any]:
     if not os.path.exists(file_path):
         return {"status": "error", "message": f"Uploaded file no longer exists: {file_path}"}
 
+    max_rows = get_settings().max_upload_rows
     df = pd.read_csv(file_path)
     rows, cols = df.shape
+    if rows > max_rows:
+        # Bounded by Settings.max_upload_rows so a 10-million-row CSV
+        # can't monopolise a worker for hours. Returns an error result
+        # rather than partial success so the caller decides whether to
+        # re-shard and resubmit.
+        return {
+            "status": "error",
+            "message": f"CSV has {rows} rows; the per-upload limit is {max_rows}. Split the file and resubmit.",
+            "row_count": rows,
+            "limit": max_rows,
+        }
     risk_scores: list[float] = []
     safe_count = warn_count = crit_count = 0
     for _, row in df.iterrows():
@@ -182,6 +198,10 @@ async def dispatch_alert(ctx: dict[str, Any], payload: dict[str, Any]) -> dict[s
                 "dispatch skipped (duplicate idempotency key)",
                 extra={"idempotency_key": idempotency_key},
             )
+            # Count each channel as skipped so hit-ratio metrics
+            # don't drift when a burst of duplicate frames arrives.
+            record_dispatch_outcome(channel="email", outcome="skipped")
+            record_dispatch_outcome(channel="sms", outcome="skipped")
             return {
                 "status": "skipped",
                 "reason": "duplicate",
@@ -195,6 +215,12 @@ async def dispatch_alert(ctx: dict[str, Any], payload: dict[str, Any]) -> dict[s
         logger.warning("dispatch attempt %d failed: %s", attempt, exc)
         if attempt >= DISPATCH_MAX_TRIES:
             await _dead_letter(redis, payload, exc, attempt)
+            # We don't know which channel failed here (dispatch is
+            # email-then-sms, first exception aborts), so charge the
+            # dead-letter to both. Real-world routing would split into
+            # two independent tasks.
+            record_dispatch_outcome(channel="email", outcome="dead_lettered")
+            record_dispatch_outcome(channel="sms", outcome="dead_lettered")
             return {
                 "status": "dead_lettered",
                 "attempts": attempt,
@@ -204,6 +230,8 @@ async def dispatch_alert(ctx: dict[str, Any], payload: dict[str, Any]) -> dict[s
         # Exponential backoff: 2s, 4s, 8s.
         raise Retry(defer=2 ** attempt)
 
+    record_dispatch_outcome(channel="email", outcome=email_result.get("status", "sent"))
+    record_dispatch_outcome(channel="sms", outcome=sms_result.get("status", "sent"))
     return {
         "status": "delivered",
         "attempts": attempt,

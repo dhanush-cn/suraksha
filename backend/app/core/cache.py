@@ -28,6 +28,7 @@ import logging
 from typing import Any, Awaitable, Callable, TypeVar
 
 from app.core.config import get_settings
+from app.core.metrics import record_cache_hit, record_cache_miss
 from app.core.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
@@ -43,46 +44,63 @@ def _mine_key(mine_id: int) -> str:
 
 
 async def get_cached_mine(mine_id: int) -> dict[str, Any] | None:
-    """Read a single mine record from cache; ``None`` on miss / outage."""
+    """Read a single mine record from cache; ``None`` on miss / outage.
+
+    Records to Prometheus: outage counts as a miss (from the caller's
+    POV they still had to hit the DB), so hit-ratio metrics stay honest
+    during a Redis outage instead of silently dropping the sample.
+    """
     client = await get_redis()
     if client is None:
+        record_cache_miss("mine")
         return None
     try:
         raw = await client.get(_mine_key(mine_id))
     except Exception as exc:  # noqa: BLE001
         logger.warning("cache read failed for mine %s: %s", mine_id, exc)
+        record_cache_miss("mine")
         return None
     if raw is None:
+        record_cache_miss("mine")
         return None
     try:
-        return json.loads(raw)
+        payload = json.loads(raw)
+        record_cache_hit("mine")
+        return payload
     except (ValueError, TypeError):
         # Poisoned entry -- drop it so the next read repopulates.
         try:
             await client.delete(_mine_key(mine_id))
         except Exception:  # noqa: BLE001,S110 -- best effort
             pass
+        record_cache_miss("mine")
         return None
 
 
 async def get_cached_mine_list() -> list[dict[str, Any]] | None:
     client = await get_redis()
     if client is None:
+        record_cache_miss("mine_list")
         return None
     try:
         raw = await client.get(_MINE_LIST_KEY)
     except Exception as exc:  # noqa: BLE001
         logger.warning("cache read failed for mine list: %s", exc)
+        record_cache_miss("mine_list")
         return None
     if raw is None:
+        record_cache_miss("mine_list")
         return None
     try:
-        return json.loads(raw)
+        payload = json.loads(raw)
+        record_cache_hit("mine_list")
+        return payload
     except (ValueError, TypeError):
         try:
             await client.delete(_MINE_LIST_KEY)
         except Exception:  # noqa: BLE001,S110
             pass
+        record_cache_miss("mine_list")
         return None
 
 

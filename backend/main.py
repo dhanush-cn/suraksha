@@ -60,7 +60,11 @@ from app.api.deps import (
 )
 from app.core.blocklist import blocklist_size, revoke
 from app.core.cache import cache_stats
+from app.core.config import get_settings
 from app.core.exceptions import AppError
+from app.core.logging import configure_logging
+from app.core.metrics import record_http_request
+from app.core.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
 from app.core.rate_limit import rate_limit_predict_risk, rate_limit_upload_csv
 from app.core.security import decode_token, revocation_ttl_seconds
 from app.core.streams import recent_events, stream_length
@@ -80,11 +84,31 @@ from database import init_db, get_recent_alerts  # still writes/reads the same S
 from simulator import simulator_instance
 from weather_service import fetch_open_meteo_weather
 
+# Structured JSON logging with correlation IDs. configure_logging is
+# idempotent (safe to call at import time even under multiple test
+# reloads). Every log line downstream now carries the correlation ID
+# threaded through by RequestContextMiddleware.
+configure_logging(get_settings())
+
 app = FastAPI(
     title="RockfallGuard - Open-Pit Mine Geological Risk Warning API",
     description="Proactive multi-sensor data fusion, weather integration & ML rockfall early warning system.",
     version="2.0.0",
 )
+
+# Correlation ID middleware -- sets X-Request-ID, attaches to logging
+# context, and emits the request-completed structured log line. Added
+# FIRST so its outer try/finally sees every response (middlewares wrap
+# in reverse order of add_middleware calls; the outermost is the one
+# added first here per starlette semantics).
+app.add_middleware(RequestContextMiddleware)
+
+# Reject requests whose declared Content-Length exceeds
+# max_request_body_bytes (default 10MB) BEFORE the handler starts
+# reading the body. Prevents a client from uploading a 5GB file and
+# taking a worker slot for the whole upload just to reject at the row
+# cap. Enforced early = cheap.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=get_settings().max_request_body_bytes)
 
 app.add_middleware(
     CORSMiddleware,
@@ -93,6 +117,43 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# HTTP-metrics middleware -- Counter + Histogram per (method, templated
+# path, status). Kept as a decorator around each response rather than
+# in the request-context middleware because Prometheus metric labels
+# are strict about the closed-set discipline and we want that in one
+# reviewable place.
+@app.middleware("http")
+async def _prometheus_http_middleware(request, call_next):
+    import time as _time
+
+    from starlette.routing import Match
+
+    start = _time.perf_counter()
+    response = await call_next(request)
+    elapsed = _time.perf_counter() - start
+
+    # Prefer the templated route path (``/api/mines/{mine_id}``) over
+    # request.url.path (``/api/mines/42``) so Prometheus cardinality
+    # stays bounded by route count, not by every path the client hits.
+    path_label = request.url.path
+    for route in request.app.routes:
+        try:
+            match, _ = route.matches(request.scope)
+        except Exception:  # noqa: BLE001,S110 -- best effort
+            continue
+        if match == Match.FULL:
+            path_label = getattr(route, "path", path_label)
+            break
+
+    record_http_request(
+        method=request.method,
+        path=path_label,
+        status=response.status_code,
+        elapsed_s=elapsed,
+    )
+    return response
 
 # Initialize the database eagerly at import time (not only via the startup
 # event): init_db() is idempotent (CREATE TABLE IF NOT EXISTS), and
@@ -184,15 +245,77 @@ def _mine_to_dict(mine: Mine) -> Dict[str, Any]:
 
 @app.get("/api/health")
 async def health_check() -> Dict[str, Any]:
-    # Uses the async client (same pool everything else uses) instead
-    # of maintaining a parallel sync client just for the healthcheck.
-    # Absent client -> not connected; short-circuits before ping().
+    """Backwards-compatible aggregated healthcheck.
+
+    Preserved because the existing test_app.py + frontend depend on
+    the response shape ``{"status": "online", "redis_connected": bool}``.
+    New callers should prefer ``/health/live`` and ``/health/ready``
+    below for k8s-style probe semantics.
+    """
     redis_client = await get_redis()
     return {
         "status": "online",
         "system": "RockfallGuard Proactive Slope Stability Engine",
         "redis_connected": redis_client is not None,
     }
+
+
+# --- Kubernetes-style probes ---------------------------------------------
+#
+# Liveness: "process is alive". Returns 200 as long as the app can
+# answer HTTP. If this ever fails, the orchestrator restarts the pod.
+# Deliberately does NOT check external dependencies -- a Redis blip
+# should NOT restart a healthy API pod.
+#
+# Readiness: "process is ready to serve traffic". Returns 200 only
+# when the DB and Redis are both reachable. If this fails, the
+# orchestrator drops the pod from the load-balancer target set until
+# it recovers -- no restart, just no new traffic. This is the correct
+# response to a Redis outage: stop taking new work, don't kill the
+# pods that could still serve degraded reads if traffic returned.
+@app.get("/health/live")
+def liveness_probe() -> Dict[str, str]:
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+async def readiness_probe():
+    """503 with which subsystem is down when a dep is unreachable."""
+    import sqlalchemy as _sa
+    from fastapi.responses import JSONResponse as _JSONResponse
+
+    from app.db.engine import get_engine as _db_engine
+
+    checks: Dict[str, str] = {}
+
+    # DB: SELECT 1 through the async engine's own pool.
+    try:
+        engine = _db_engine()
+        async with engine.connect() as conn:
+            await conn.execute(_sa.text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as exc:  # noqa: BLE001
+        checks["db"] = f"error: {exc}"
+
+    # Redis: ping through the async client.
+    redis_client = await get_redis()
+    checks["redis"] = "ok" if redis_client is not None else "unreachable"
+
+    all_ok = all(v == "ok" for v in checks.values())
+    payload = {"status": "ready" if all_ok else "not_ready", "checks": checks}
+    if not all_ok:
+        return _JSONResponse(status_code=503, content=payload)
+    return payload
+
+
+# Prometheus scrape endpoint. Exposes the standard text-format output
+# from every metric defined in app.core.metrics.
+@app.get("/metrics")
+def prometheus_metrics():
+    from fastapi.responses import Response as _Response
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+    return _Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # 0. Authentication
@@ -417,6 +540,15 @@ _UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "../data/uploads")
 async def upload_custom_dataset(file: UploadFile = File(...)) -> Dict[str, Any]:
     if not file.filename or not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
+    # Content-Type check: the extension can be spoofed, but so can this
+    # header -- both together raise the bar without pretending to be a
+    # security guarantee. The real check is the worker actually parsing
+    # the bytes as CSV via pandas; anything malformed errors there.
+    if file.content_type not in {"text/csv", "application/csv", "application/vnd.ms-excel", "text/plain"}:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported CSV content-type: {file.content_type!r}",
+        )
 
     os.makedirs(_UPLOAD_DIR, exist_ok=True)
     file_path = os.path.join(_UPLOAD_DIR, f"csv_{uuid.uuid4().hex}.csv")
@@ -444,6 +576,14 @@ async def analyze_drone_image_endpoint(
 ) -> Dict[str, Any]:
     if file is None:
         raise HTTPException(status_code=400, detail="Please select an image file to upload.")
+    # Enforce declared content-type up front. PIL will happily open
+    # anything image-shaped, but a client uploading raw PDFs or ZIPs
+    # is either broken or probing -- fail fast either way.
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported image content-type: {file.content_type!r}",
+        )
     contents = await file.read()
     if not contents or len(contents) < 10:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")

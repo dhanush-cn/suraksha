@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.core.metrics import observe_ml_inference
+
 # The ml_engine module lives at backend/ml_engine.py (a sibling of main.py).
 # Services import it directly rather than via a repository because the
 # model has no persistence surface -- it's stateless inference.
@@ -36,7 +38,11 @@ class RiskService:
     and to make it trivially mockable in unit tests."""
 
     def predict(self, sensor_input: dict[str, Any]) -> dict[str, Any]:
-        return predict_rockfall_risk(sensor_input)
+        # Timed at the service edge so the histogram measures
+        # "everything the caller sees" -- data prep + inference + SHAP,
+        # not just the raw model call.
+        with observe_ml_inference():
+            return predict_rockfall_risk(sensor_input)
 
     def extract_top_reason(self, prediction: dict[str, Any]) -> str:
         """First SHAP explanation string, or the shared fallback.
