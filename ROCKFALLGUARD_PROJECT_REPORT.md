@@ -1,7 +1,7 @@
 # RockfallGuard Project Report & Simple Guide
 
 > **System:** Proactive Open-Pit Mine Geological Risk Warning Platform  
-> **Accuracy:** 99.50% Holdout Test Set Accuracy (100% Failure Event Recall)  
+> **Evaluation:** Synthetic benchmark — 0.79 Critical-class recall at 0.38 precision (temporal split). See [MODEL_CARD.md](MODEL_CARD.md).  
 > **Web Dashboard:** [http://127.0.0.1:8009](http://127.0.0.1:8009)
 
 ---
@@ -14,7 +14,7 @@
 
 ## 1. The Problem We Solved
 
-In open-pit mining, giant open rock faces can collapse without warning due to heavy rainfall or underground water pressure. Traditional alarm systems only sound an alert *after* rocks start falling. **RockfallGuard** uses Machine Learning (ML) to provide proactive early warnings with **99.5% Accuracy**.
+In open-pit mining, giant open rock faces can collapse without warning due to heavy rainfall or underground water pressure. Traditional alarm systems only sound an alert *after* rocks start falling. **RockfallGuard** uses Machine Learning (ML) to provide proactive early warnings. The risk model is evaluated on synthetic data with a temporal split; see [MODEL_CARD.md](MODEL_CARD.md) for metrics and limitations.
 
 ---
 

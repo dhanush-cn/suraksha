@@ -109,7 +109,7 @@
         <button class="print-btn" onclick="window.print()">🖨️ Save as PDF / Print</button>
         <h1>RockfallGuard Project Documentation</h1>
         <p><strong>System:</strong> Proactive Open-Pit Mine Geological Risk Warning Platform<br/>
-        <strong>Model Accuracy:</strong> 99.50% Holdout Test Accuracy (100% Failure Event Recall)<br/>
+        <strong>Evaluation:</strong> Synthetic benchmark — 0.79 Critical-class recall at 0.38 precision (temporal split). See <a href='MODEL_CARD.md' style='color:#60a5fa;'>MODEL_CARD.md</a>.<br/>
         <strong>Live Web Dashboard:</strong> <a href="http://127.0.0.1:8009" style="color:#60a5fa;">http://127.0.0.1:8009</a></p>
         
         <div class="highlight-box">
@@ -164,7 +164,7 @@
             </tr>
             <tr>
                 <td><strong>🛸 Drone Photo Scanning</strong></td>
-                <td>PyTorch Deep Learning CNN (<code>PitWallCNN</code> trained on 4,617 Kaggle images) inspects aerial drone photos for rock cracks.</td>
+                <td>PyTorch Deep Learning CNN (<code>PitWallCNN</code> — requires trained weights; see MODEL_CARD.md) inspects aerial drone photos for rock cracks.</td>
             </tr>
             <tr>
                 <td><strong>🗺️ Interactive GPS Map</strong></td>
@@ -204,7 +204,7 @@
             </tr>
             <tr>
                 <td><strong>Deep Learning Vision</strong></td>
-                <td>PyTorch, torchvision (<code>PitWallCNN</code> trained on 4,617 Kaggle drone images)</td>
+                <td>PyTorch, torchvision (<code>PitWallCNN</code> — requires training; see MODEL_CARD.md)</td>
             </tr>
             <tr>
                 <td><strong>Database</strong></td>
@@ -226,10 +226,11 @@
 
         <h2>5. Model Accuracy & Results 📈</h2>
         <ul>
-            <li><strong>Holdout Test Set Accuracy:</strong> <strong>99.50%</strong> (exceeds >95% requirement)</li>
-            <li><strong>5-Fold Cross-Validation Accuracy:</strong> <strong>99.83%</strong></li>
-            <li><strong>Critical Failure Event Recall:</strong> <strong>100.0%</strong> (Zero missed slope collapses)</li>
-            <li><strong>False Alarm Rate:</strong> <strong>0.17%</strong> (Machinery noise filtered out)</li>
+            <li><strong>Critical recall:</strong> <strong>0.79</strong> — caught ~79% of simulated failure states</li>
+            <li><strong>Critical precision:</strong> <strong>0.38</strong> — threshold tuned for recall; see MODEL_CARD.md</li>
+            <li><strong>Critical PR-AUC:</strong> <strong>0.63</strong></li>
+            <li><strong>Overall accuracy:</strong> <strong>0.91</strong> — do not quote alone (see MODEL_CARD.md)</li>
+            <li><strong>Data:</strong> Synthetic. These are NOT real-world prediction claims.</li>
         </ul>
 
         <h2>6. How to Run & Use the Dashboard</h2>
