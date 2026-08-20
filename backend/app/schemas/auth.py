@@ -13,6 +13,7 @@ reintroduced by a later caller forgetting to check.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any, Self
 
@@ -21,6 +22,52 @@ from pydantic import Field, StringConstraints, model_validator
 from app.core.exceptions import TenantAccessDeniedError
 from app.core.security import Role, TokenType
 from app.schemas.base import PositiveId, RequestModel, ResponseModel
+
+
+@dataclass(frozen=True)
+class TenantScope:
+    """Row-level access scope derived from a Principal.
+
+    Every list endpoint takes a ``TenantScope`` (never a raw Principal or a
+    plain ``mine_id``) so the "for whom?" question is answered by an object
+    the type system knows about, not a convention every author has to
+    remember. A repository method whose signature demands ``scope:
+    TenantScope`` cannot be called without one, so a new endpoint whose
+    author forgot to filter fails at call-site construction, not with a
+    silent cross-tenant leak at runtime.
+
+    The dataclass is frozen so it can be passed through async layers
+    without concurrent mutation surprises, and small enough to cache-key on
+    via :meth:`scope_hash`.
+    """
+
+    is_admin: bool
+    # Non-admins are guaranteed to have a mine_id by the Principal
+    # invariant (a non-admin token with mine_id=None is refused at
+    # Principal construction). This field being Optional here is only for
+    # the admin case, where mine_id is intentionally None.
+    mine_id: int | None
+
+    @classmethod
+    def from_principal(cls, principal: "Principal") -> "TenantScope":
+        return cls(is_admin=principal.is_admin, mine_id=principal.mine_id)
+
+    def scope_hash(self) -> str:
+        """A stable, cache-safe string identifying this scope.
+
+        Used as a suffix on Redis cache keys so an admin's cached list
+        of mines can never be served to an operator, and vice versa.
+        ``"admin"`` for admins; ``"mine:<id>"`` for operators. Never
+        include the username -- two operators of the same mine share
+        cached data legitimately, so bucketing by user would just miss.
+        """
+        return "admin" if self.is_admin else f"mine:{self.mine_id}"
+
+    def visible_mine_ids(self, all_mine_ids: list[int]) -> list[int]:
+        """Filter a list of mine ids down to what this scope can see."""
+        if self.is_admin:
+            return list(all_mine_ids)
+        return [mid for mid in all_mine_ids if mid == self.mine_id]
 
 Username = Annotated[
     str,
@@ -149,6 +196,7 @@ __all__ = [
     "Password",
     "Principal",
     "RefreshRequest",
+    "TenantScope",
     "TokenPair",
     "UserRead",
     "Username",

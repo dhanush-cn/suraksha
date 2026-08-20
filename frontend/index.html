@@ -3,439 +3,266 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RockfallGuard | Open-Pit Mine Geological Risk Warning System</title>
-    <!-- Google Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
-    <!-- Chart.js CDN -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <!-- Leaflet.js CDN for Mine Map -->
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <link rel="stylesheet" href="styles.css?v=2.3.0">
+    <title>RockfallGuard — Slope Stability Monitor</title>
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
+    <script src="/app.js" defer></script>
 </head>
-<body class="dark-theme">
+<body>
 
-    <!-- Top Navigation Bar -->
-    <header class="navbar">
-        <div class="logo-container">
-            <div class="radar-pulse"></div>
-            <div class="brand">
-                <span class="brand-title">ROCKFALL<span class="highlight">GUARD</span></span>
-                <span class="brand-sub">AI Slope Stability & Geological Hazard Intelligence</span>
-            </div>
+<!-- ── Emergency banner (hidden until risk >= threshold) ─────────────── -->
+<div id="emergencyAlertBanner" class="alert-banner hidden" role="alert">
+    <div class="alert-inner">
+        <div class="alert-icon">⚠</div>
+        <div class="alert-copy">
+            <div id="alertTitle" class="alert-title">Critical slope collapse alert</div>
+            <div id="alertBody"  class="alert-body">Risk exceeded configured threshold.</div>
+            <div id="alertShapSummary" class="alert-shap"></div>
         </div>
+        <button id="dismissAlertBtn" class="alert-dismiss" aria-label="Dismiss">✕</button>
+    </div>
+</div>
 
-        <div class="nav-controls">
-            <!-- RBAC User Context Badge & Scope Bar -->
-            <div id="userProfileBar" class="user-profile-bar">
-                <span id="userNameTag" class="user-name">👤 guest_operator</span>
-                <span id="userRoleBadge" class="role-badge role-admin">ADMIN</span>
-                <span id="tenantScopeBadge" class="tenant-badge">Scope: Global Multi-Tenant</span>
-                <button id="authLoginBtn" class="btn btn-outline-sm">🔐 Switch Account</button>
-                <button id="authLogoutBtn" class="btn btn-danger-sm hidden">🚪 Logout</button>
-            </div>
-
-            <div class="mine-selector-wrapper">
-                <label for="mineSelect">Active Mine:</label>
-                <select id="mineSelect" class="styled-select">
-                    <!-- Loaded dynamically -->
-                </select>
-                <button id="deleteMineBtn" class="btn-danger-sm" title="Delete Selected Pit Mine">🗑️ Delete</button>
-            </div>
-
-            <button id="openRegisterModalBtn" class="btn btn-primary">+ Register Mine</button>
-            <button id="openDroneModalBtn" class="btn btn-secondary">🛸 Drone CNN</button>
-            <button id="openUploadModalBtn" class="btn btn-secondary">Upload CSV</button>
-            
-            <button id="soundToggleBtn" class="btn btn-icon" title="Toggle Alarm Sound">
-                <span id="soundIcon">🔊</span>
-            </button>
-        </div>
-    </header>
-
-    <!-- Emergency Risk Alert Banner (Triggers dynamically when risk >= threshold e.g. 60-80%) -->
-    <div id="emergencyAlertBanner" class="alert-banner hidden">
-        <div class="alert-content">
-            <div class="alert-icon-pulse">🚨</div>
-            <div class="alert-text">
-                <h2 id="alertTitle">CRITICAL GEOLOGICAL HAZARD ALERT</h2>
-                <p id="alertBody">Imminent Rockfall Collapse Risk exceeds threshold! Evacuate pit sectors immediately.</p>
-                <div id="alertShapSummary" class="alert-shap">Top Factor: Accelerated Creep Velocity</div>
-            </div>
-            <button id="dismissAlertBtn" class="btn btn-outline-light">Acknowledge Alert</button>
+<!-- ── Top bar ───────────────────────────────────────────────────────── -->
+<header class="topbar">
+    <div class="topbar-brand">
+        <div class="brand-mark">RG</div>
+        <div>
+            <div class="brand-title">RockfallGuard</div>
+            <div class="brand-sub">Open-pit slope stability monitor</div>
         </div>
     </div>
+    <div class="topbar-actions">
+        <button id="soundToggleBtn" class="icon-btn" aria-label="Toggle alert sound">
+            <span id="soundIcon">🔊</span>
+        </button>
+        <div class="user-badge">
+            <span id="userNameLabel" class="user-name">Signed in</span>
+            <span id="userRoleLabel" class="user-role">—</span>
+        </div>
+    </div>
+</header>
 
-    <main class="dashboard-grid">
+<main class="page">
 
-        <!-- Left Column: Risk Gauge & Weather -->
-        <section class="card risk-card">
-            <div class="card-header">
-                <h3>Continuous Hazard Risk Score</h3>
+    <!-- ── Toolbar: mine selector + actions ──────────────────────────── -->
+    <section class="toolbar">
+        <div class="toolbar-select">
+            <label for="mineSelect" class="field-label">Active mine</label>
+            <select id="mineSelect" class="select"></select>
+        </div>
+        <div class="toolbar-actions">
+            <button id="openRegisterModalBtn" class="btn btn-ghost">＋ Register mine</button>
+            <button id="openUploadModalBtn"   class="btn btn-ghost">↑ Upload CSV</button>
+            <button id="openDroneModalBtn"    class="btn btn-ghost">◇ Analyze drone image</button>
+        </div>
+    </section>
+
+    <!-- ── Row 1: risk + mine details + weather ──────────────────────── -->
+    <section class="grid-3">
+        <article class="card card-emphasis">
+            <div class="card-head">
+                <h2 class="card-title">Risk score</h2>
                 <span id="riskCategoryBadge" class="badge badge-safe">SAFE</span>
             </div>
-            
-            <div class="gauge-wrapper">
-                <div class="gauge-body">
-                    <svg viewBox="0 0 100 100" class="gauge-svg">
-                        <circle class="gauge-bg" cx="50" cy="50" r="42"></circle>
-                        <circle id="gaugeFill" class="gauge-fill" cx="50" cy="50" r="42"></circle>
-                    </svg>
-                    <div class="gauge-readout">
-                        <span id="riskPctVal" class="risk-number">12.4%</span>
-                        <span class="risk-label">FAILURE PROBABILITY</span>
-                    </div>
+            <div class="gauge-wrap">
+                <svg class="gauge-svg" viewBox="0 0 100 100" aria-hidden="true">
+                    <circle cx="50" cy="50" r="42" class="gauge-track"/>
+                    <circle id="gaugeFill" cx="50" cy="50" r="42"
+                            class="gauge-fill" transform="rotate(-90 50 50)"
+                            stroke-dasharray="264" stroke-dashoffset="264"/>
+                </svg>
+                <div class="gauge-center">
+                    <div id="riskPctVal" class="gauge-value">0.0%</div>
+                    <div class="gauge-caption">Failure probability</div>
                 </div>
             </div>
-
-            <div class="probability-bars">
-                <div class="prob-item">
-                    <span>Safe (<35%)</span>
-                    <div class="bar-bg"><div id="probSafeBar" class="bar-fill green" style="width: 85%;"></div></div>
-                    <span id="probSafeVal">85%</span>
-                </div>
-                <div class="prob-item">
-                    <span>Warning (35-65%)</span>
-                    <div class="bar-bg"><div id="probWarnBar" class="bar-fill yellow" style="width: 10%;"></div></div>
-                    <span id="probWarnVal">10%</span>
-                </div>
-                <div class="prob-item">
-                    <span>Critical (>65%)</span>
-                    <div class="bar-bg"><div id="probCritBar" class="bar-fill red" style="width: 5%;"></div></div>
-                    <span id="probCritVal">5%</span>
-                </div>
+            <div class="prob-bars">
+                <div class="prob-row"><span class="prob-label">Safe</span>
+                    <div class="prob-track"><div id="probSafeBar" class="prob-fill prob-fill-safe"></div></div>
+                    <span id="probSafeVal" class="prob-val">0%</span></div>
+                <div class="prob-row"><span class="prob-label">Warning</span>
+                    <div class="prob-track"><div id="probWarnBar" class="prob-fill prob-fill-warn"></div></div>
+                    <span id="probWarnVal" class="prob-val">0%</span></div>
+                <div class="prob-row"><span class="prob-label">Critical</span>
+                    <div class="prob-track"><div id="probCritBar" class="prob-fill prob-fill-crit"></div></div>
+                    <span id="probCritVal" class="prob-val">0%</span></div>
             </div>
+        </article>
 
-            <div class="mine-info-panel">
-                <div class="info-row">
-                    <span class="info-label">Mine Company:</span>
-                    <span id="infoCompany" class="info-val">Freeport Copper</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">GPS Coordinates:</span>
-                    <span id="infoCoords" class="info-val">-4.05°, 137.11°</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Pit Depth & Slope:</span>
-                    <span id="infoDepth" class="info-val">450m | 48° Angle</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Alert Trigger Threshold:</span>
-                    <span id="infoThreshold" class="info-val highlight-amber">70.0%</span>
-                </div>
-                <div id="interactiveMineMap" style="height: 140px; min-height: 140px; width: 100%; border-radius: 8px; border: 1px solid #334155; margin-top: 10px; z-index: 1;"></div>
+        <article class="card">
+            <div class="card-head"><h2 class="card-title">Mine details</h2></div>
+            <dl class="detail-list">
+                <div class="detail-row"><dt>Operator</dt><dd id="infoCompany">—</dd></div>
+                <div class="detail-row"><dt>Coordinates</dt><dd id="infoCoords">—</dd></div>
+                <div class="detail-row"><dt>Pit depth · slope</dt><dd id="infoDepth">—</dd></div>
+                <div class="detail-row"><dt>Alert threshold</dt><dd id="infoThreshold">—</dd></div>
+            </dl>
+        </article>
+
+        <article class="card">
+            <div class="card-head">
+                <h2 class="card-title">Weather</h2>
+                <span id="weatherSourceBadge" class="badge badge-muted">Open-Meteo</span>
             </div>
-        </section>
-
-        <!-- Center Column: SHAP Model Explainability & Live Telemetry -->
-        <section class="center-panel">
-                    <span id="infoCoords" class="info-val">-4.05°, 137.11°</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Pit Depth & Slope:</span>
-                    <span id="infoDepth" class="info-val">450m | 48° Angle</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Alert Trigger Threshold:</span>
-                    <span id="infoThreshold" class="info-val highlight-amber">70.0%</span>
-                </div>
-                <div id="interactiveMineMap" style="height: 140px; width: 100%; margin-top: 10px; border-radius: 8px; border: 1px solid #334155; overflow: hidden;"></div>
+            <div class="metric-grid">
+                <div class="metric"><div class="metric-label">Rainfall</div>
+                    <div id="wRainVal" class="metric-value">— mm/h</div></div>
+                <div class="metric"><div class="metric-label">Humidity</div>
+                    <div id="wHumidityVal" class="metric-value">—</div></div>
+                <div class="metric"><div class="metric-label">Temperature</div>
+                    <div id="wTempVal" class="metric-value">—</div></div>
+                <div class="metric"><div class="metric-label">Pressure</div>
+                    <div id="wPressureVal" class="metric-value">—</div></div>
             </div>
-        </section>
+        </article>
+    </section>
 
-        <!-- Center Column: SHAP Model Explainability & Live Telemetry -->
-        <section class="center-panel">
-            
-            <!-- SHAP Explainability Card -->
-            <div class="card shap-card">
-                <div class="card-header">
-                    <h3>SHAP Explainable AI (Model Feature Breakdown)</h3>
-                    <span class="tag">XGBoost + SHAP TreeExplainer</span>
-                </div>
-                <p class="section-desc">Identifies physical root causes behind current hazard risk calculations:</p>
-                <div id="shapReasonsContainer" class="shap-list">
-                    <!-- Dynamic SHAP reason cards -->
-                </div>
+    <!-- ── Row 2: map + scenario simulator ───────────────────────────── -->
+    <section class="grid-2">
+        <article class="card">
+            <div class="card-head"><h2 class="card-title">Location</h2></div>
+            <div id="interactiveMineMap" class="map-canvas"></div>
+        </article>
+
+        <article class="card">
+            <div class="card-head">
+                <h2 class="card-title">Scenario simulator</h2>
+                <span class="badge badge-muted">Live telemetry</span>
             </div>
-
-            <!-- Weather & Environmental Card -->
-            <div class="card weather-card">
-                <div class="card-header">
-                    <h3>Open-Meteo Weather Telemetry</h3>
-                    <span id="weatherSourceBadge" class="tag tag-blue">Open-Meteo API</span>
-                </div>
-                <div class="weather-metrics-grid">
-                    <div class="weather-box">
-                        <span class="w-icon">🌧️</span>
-                        <div class="w-data">
-                            <span id="wRainVal" class="w-val">0.0 mm/h</span>
-                            <span class="w-lbl">Instant Rainfall</span>
-                        </div>
-                    </div>
-                    <div class="weather-box">
-                        <span class="w-icon">💧</span>
-                        <div class="w-data">
-                            <span id="wHumidityVal" class="w-val">65.0%</span>
-                            <span class="w-lbl">Relative Humidity</span>
-                        </div>
-                    </div>
-                    <div class="weather-box">
-                        <span class="w-icon">🌡️</span>
-                        <div class="w-data">
-                            <span id="wTempVal" class="w-val">24.0 °C</span>
-                            <span class="w-lbl">Air Temperature</span>
-                        </div>
-                    </div>
-                    <div class="weather-box">
-                        <span class="w-icon">⏲️</span>
-                        <div class="w-data">
-                            <span id="wPressureVal" class="w-val">1013 hPa</span>
-                            <span class="w-lbl">Barometric Pressure</span>
-                        </div>
-                    </div>
-                </div>
+            <div class="sim-grid">
+                <button class="sim-btn active" data-scenario="normal">
+                    <span class="sim-dot dot-safe"></span>
+                    <span class="sim-copy"><strong>Normal</strong><small>Baseline operation</small></span>
+                </button>
+                <button class="sim-btn" data-scenario="heavy_rain">
+                    <span class="sim-dot dot-warn"></span>
+                    <span class="sim-copy"><strong>Heavy rain</strong><small>Monsoon pore-pressure rise</small></span>
+                </button>
+                <button class="sim-btn" data-scenario="machinery_noise">
+                    <span class="sim-dot dot-info"></span>
+                    <span class="sim-copy"><strong>Machinery noise</strong><small>Haul-truck seismic confounder</small></span>
+                </button>
+                <button class="sim-btn" data-scenario="critical_failure">
+                    <span class="sim-dot dot-crit"></span>
+                    <span class="sim-copy"><strong>Imminent failure</strong><small>Tertiary creep &gt; 80%</small></span>
+                </button>
             </div>
+        </article>
+    </section>
 
-            <!-- Automated Email & SMS Emergency Dispatches -->
-            <div class="card dispatch-card">
-                <div class="card-header">
-                    <h3>Automated Email & SMS Emergency Dispatches</h3>
-                    <button id="triggerTestDispatchBtn" class="btn btn-outline-sm" onclick="triggerEmergencyDispatchTest()">⚡ Trigger Live SMS & Email Dispatch</button>
-                </div>
-                <div id="dispatchLogList" class="dispatch-list">
-                    <div class="dispatch-item placeholder">
-                        <span>📧 Registered Email & Phone Alerts ready for dispatch on >60-80% hazard trigger</span>
-                    </div>
-                </div>
+    <!-- ── Row 3: three time-series charts ───────────────────────────── -->
+    <section class="grid-3">
+        <article class="card">
+            <div class="card-head"><h2 class="card-title">Slope velocity</h2>
+                <span class="card-sub">mm/h</span></div>
+            <div class="chart-wrap"><canvas id="displacementChart"></canvas></div>
+        </article>
+        <article class="card">
+            <div class="card-head"><h2 class="card-title">Pore pressure</h2>
+                <span class="card-sub">kPa</span></div>
+            <div class="chart-wrap"><canvas id="porePressureChart"></canvas></div>
+        </article>
+        <article class="card">
+            <div class="card-head"><h2 class="card-title">Seismic RMS</h2>
+                <span class="card-sub">g (raw)</span></div>
+            <div class="chart-wrap"><canvas id="seismicChart"></canvas></div>
+        </article>
+    </section>
+
+    <!-- ── SHAP explanation list ─────────────────────────────────────── -->
+    <section>
+        <article class="card">
+            <div class="card-head">
+                <h2 class="card-title">Top contributing factors</h2>
+                <span class="card-sub">SHAP explanations</span>
             </div>
-
-            <!-- Simulation Controls -->
-            <div class="card sim-card">
-                <div class="card-header">
-                    <h3>Real-Time Scenario Simulator</h3>
-                    <span class="tag tag-purple">Live Telemetry Stream</span>
-                </div>
-                <div class="sim-btn-group">
-                    <button class="sim-btn active" data-scenario="normal">🟢 Normal Operation</button>
-                    <button class="sim-btn" data-scenario="heavy_rain">🌧️ Heavy Monsoon Storm</button>
-                    <button class="sim-btn" data-scenario="machinery_noise">🚜 Machinery Noise (Butterworth Filter)</button>
-                    <button class="sim-btn danger" data-scenario="critical_failure">🚨 Imminent Slope Failure (>80% Alert)</button>
-                </div>
+            <div id="shapReasonsContainer" class="shap-list">
+                <div class="shap-empty">Awaiting first prediction…</div>
             </div>
+        </article>
+    </section>
 
-        </section>
+</main>
 
-        <!-- Right Column: Sensor Graphs -->
-        <section class="right-panel">
-            
-            <div class="card chart-card">
-                <div class="card-header">
-                    <h3>Extensometer Displacement & Velocity</h3>
-                </div>
-                <div class="chart-container">
-                    <canvas id="displacementChart"></canvas>
-                </div>
+<!-- ── Register-mine modal ───────────────────────────────────────────── -->
+<div id="registerModal" class="modal hidden">
+    <div class="modal-card">
+        <div class="modal-head">
+            <h3>Register a new mine</h3>
+            <button id="closeRegisterModalBtn" class="icon-btn">✕</button>
+        </div>
+        <form id="registerForm" class="modal-body">
+            <div class="form-row"><label>Name</label><input name="name" required></div>
+            <div class="form-row"><label>Company</label><input name="company" required></div>
+            <div class="form-row"><label>Location name</label><input name="location_name" required></div>
+            <div class="form-grid-2">
+                <div class="form-row"><label>Latitude</label><input name="latitude" type="number" step="0.0001" required></div>
+                <div class="form-row"><label>Longitude</label><input name="longitude" type="number" step="0.0001" required></div>
             </div>
-
-            <div class="card chart-card">
-                <div class="card-header">
-                    <h3>Piezometer Pore Water Pressure (kPa)</h3>
-                </div>
-                <div class="chart-container">
-                    <canvas id="porePressureChart"></canvas>
-                </div>
+            <div class="form-grid-2">
+                <div class="form-row"><label>Pit depth (m)</label><input name="pit_depth_m" type="number" value="350"></div>
+                <div class="form-row"><label>Slope angle (°)</label><input name="slope_angle_deg" type="number" value="48"></div>
             </div>
-
-            <div class="card chart-card">
-                <div class="card-header">
-                    <h3>Microseismic Vibration (Butterworth Filtered)</h3>
-                </div>
-                <div class="chart-container">
-                    <canvas id="seismicChart"></canvas>
-                </div>
-            </div>
-
-        </section>
-
-    </main>
-
-    <!-- Mine Registration Modal -->
-    <div id="registerModal" class="modal-backdrop hidden">
-        <div class="modal-box">
-            <div class="modal-header">
-                <h2>Register New Open-Pit Mine</h2>
-                <button id="closeRegisterModalBtn" class="close-btn">&times;</button>
-            </div>
-            <form id="mineRegisterForm">
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label for="regMineName">Mine Operation Name *</label>
-                        <input type="text" id="regMineName" required placeholder="e.g. Malanjkhand Copper Pit">
-                    </div>
-                    <div class="form-group">
-                        <label for="regCompany">Mining Company *</label>
-                        <input type="text" id="regCompany" required placeholder="e.g. Hindustan Copper Ltd">
-                    </div>
-                    <div class="form-group">
-                        <label for="regLocation">Pit Sector / Location Name *</label>
-                        <input type="text" id="regLocation" required placeholder="e.g. East Wall Bench #4">
-                    </div>
-                    <div class="form-group">
-                        <label for="regLat">Latitude (GPS) *</label>
-                        <input type="number" step="0.0001" id="regLat" required value="22.015">
-                    </div>
-                    <div class="form-group">
-                        <label for="regLon">Longitude (GPS) *</label>
-                        <input type="number" step="0.0001" id="regLon" required value="80.718">
-                    </div>
-                    <div class="form-group">
-                        <label for="regDepth">Pit Depth (meters)</label>
-                        <input type="number" id="regDepth" value="300">
-                    </div>
-                    <div class="form-group">
-                        <label for="regSlope">Overall Slope Angle (°)</label>
-                        <input type="number" id="regSlope" value="46">
-                    </div>
-                    <div class="form-group">
-                        <label for="regThreshold">Emergency Alert Threshold (%) *</label>
-                        <select id="regThreshold" class="styled-select">
-                            <option value="60">60% (Early Warning)</option>
-                            <option value="70" selected>70% (High Risk Alert)</option>
-                            <option value="80">80% (Critical Evacuation Alert)</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label for="regEmail">Geologist Contact Email</label>
-                        <input type="email" id="regEmail" value="safety@mine.org">
-                    </div>
-                    <div class="form-group">
-                        <label for="regPhone">Emergency Phone / SMS</label>
-                        <input type="text" id="regPhone" value="+91 9876543210">
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button type="button" id="cancelRegisterBtn" class="btn btn-secondary">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Save & Register Mine</button>
-                </div>
-            </form>
+            <div class="form-row"><label>Contact email</label><input name="contact_email" type="email"></div>
+            <div class="form-row"><label>Alert threshold (%)</label><input name="alert_threshold_pct" type="number" value="70"></div>
+        </form>
+        <div class="modal-foot">
+            <button id="cancelRegisterBtn" class="btn btn-ghost">Cancel</button>
+            <button form="registerForm" type="submit" class="btn btn-primary">Register</button>
         </div>
     </div>
+</div>
 
-    <!-- Drone UAV CNN Inspection Modal -->
-    <div id="droneModal" class="modal-backdrop hidden">
-        <div class="modal-box">
-            <div class="modal-header">
-                <h2>🛸 Drone UAV Pit Wall CNN Crack Analysis</h2>
-                <button id="closeDroneModalBtn" class="close-btn">&times;</button>
-            </div>
-            <form id="droneImageForm">
-                <p class="form-desc">Upload aerial drone / UAV imagery of the open-pit wall. PyTorch CNN will analyze surface texture, edge gradients, and tension crack propagation.</p>
-                <div class="upload-dropzone">
-                    <input type="file" id="droneImageInput" accept="image/*" required>
-                    <div class="dropzone-text">
-                        <span class="upload-icon">📷</span>
-                        <span>Select Aerial Drone Image (Kaggle Dataset / JPG / PNG)</span>
-                    </div>
+<!-- ── Upload-CSV modal ──────────────────────────────────────────────── -->
+<div id="uploadModal" class="modal hidden">
+    <div class="modal-card">
+        <div class="modal-head">
+            <h3>Upload sensor CSV</h3>
+            <button id="closeUploadModalBtn" class="icon-btn">✕</button>
+        </div>
+        <form id="csvUploadForm" class="modal-body">
+            <label class="dropzone">
+                <input id="csvFileInput" type="file" accept=".csv" hidden>
+                <div class="dropzone-text">
+                    <span class="dropzone-icon">⬆</span>
+                    <span>Click or drop a .csv file here</span>
                 </div>
-                <div id="droneResult" class="upload-result hidden" style="margin-top: 1rem;"></div>
-                <div class="modal-footer">
-                    <button type="button" id="cancelDroneBtn" class="btn btn-secondary">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Run PyTorch CNN Analysis</button>
-                </div>
-            </form>
+            </label>
+            <div id="uploadResult" class="upload-result hidden"></div>
+        </form>
+        <div class="modal-foot">
+            <button id="cancelUploadBtn" class="btn btn-ghost">Cancel</button>
+            <button form="csvUploadForm" type="submit" class="btn btn-primary">Evaluate</button>
         </div>
     </div>
+</div>
 
-    <!-- CSV Upload Modal -->
-    <div id="uploadModal" class="modal-backdrop hidden">
-        <div class="modal-box">
-            <div class="modal-header">
-                <h2>Upload Custom Mine Telemetry CSV</h2>
-                <button id="closeUploadModalBtn" class="close-btn">&times;</button>
-            </div>
-            <form id="csvUploadForm">
-                <p class="form-desc">Upload real historical extensometer, piezometer, and weather CSV data from your mine site to evaluate or retrain the ML engine.</p>
-                <div class="upload-dropzone">
-                    <input type="file" id="csvFileInput" accept=".csv" required>
-                    <div class="dropzone-text">
-                        <span class="upload-icon">📁</span>
-                        <span>Click to browse or drag & drop CSV file</span>
-                    </div>
+<!-- ── Drone-image modal ─────────────────────────────────────────────── -->
+<div id="droneModal" class="modal hidden">
+    <div class="modal-card">
+        <div class="modal-head">
+            <h3>Drone imagery — CNN analysis</h3>
+            <button id="closeDroneModalBtn" class="icon-btn">✕</button>
+        </div>
+        <form id="droneImageForm" class="modal-body">
+            <label class="dropzone">
+                <input id="droneImageInput" type="file" accept="image/*" hidden>
+                <div class="dropzone-text">
+                    <span class="dropzone-icon">◇</span>
+                    <span>Click or drop an aerial pit-wall image</span>
                 </div>
-                <div id="uploadResult" class="upload-result hidden"></div>
-                <div class="modal-footer">
-                    <button type="button" id="cancelUploadBtn" class="btn btn-secondary">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Process & Evaluate CSV</button>
-                </div>
-            </form>
+            </label>
+            <div id="droneResult" class="upload-result hidden"></div>
+        </form>
+        <div class="modal-foot">
+            <button id="cancelDroneBtn" class="btn btn-ghost">Cancel</button>
+            <button form="droneImageForm" type="submit" class="btn btn-primary">Analyze</button>
         </div>
     </div>
+</div>
 
-    <!-- OAuth2 & JWT RBAC Login Modal -->
-    <div id="loginModal" class="modal-backdrop hidden">
-        <div class="modal-box auth-modal">
-            <div class="modal-header">
-                <h3>🔐 OAuth2 & JWT User Authentication</h3>
-                <button id="closeLoginModalBtn" class="close-btn">&times;</button>
-            </div>
-            <form id="loginForm">
-                <p class="form-desc">Log in with an Admin or Organization User account to authenticate JWT token & enforce multi-tenant data isolation.</p>
-                
-                <div class="form-group">
-                    <label>Username:</label>
-                    <input type="text" id="loginUsername" class="styled-input" placeholder="e.g. admin or grasberg_user" required>
-                </div>
-                <div class="form-group">
-                    <label>Password:</label>
-                    <input type="password" id="loginPassword" class="styled-input" placeholder="e.g. admin123 or user123" required>
-                </div>
-
-                <div class="demo-accounts-panel">
-                    <span class="demo-title">⚡ Quick Login Demo Accounts:</span>
-                    <div class="demo-btn-group">
-                        <button type="button" class="btn btn-demo-admin" id="demoAdminBtn">🔑 Log in as Admin (All Mines)</button>
-                        <button type="button" class="btn btn-demo-user" id="demoGrasbergBtn">🏢 Log in as Grasberg User (Mine #1)</button>
-                        <button type="button" class="btn btn-demo-user" id="demoCodelcoBtn">🏢 Log in as Codelco User (Mine #2)</button>
-                    </div>
-                </div>
-
-                <div id="loginErrorMsg" class="auth-error hidden"></div>
-
-                <div class="modal-footer">
-                    <button type="button" id="cancelLoginBtn" class="btn btn-secondary">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Authenticate & Issue JWT</button>
-                </div>
-            </form>
-        </div>
-    </div>
-
-    <!-- Drone UAV Computer Vision CNN Analysis Modal -->
-    <div id="droneModal" class="modal-backdrop hidden">
-        <div class="modal-box">
-            <div class="modal-header">
-                <h2>🚁 Drone UAV Aerial Pit Wall CNN Inspection</h2>
-                <button id="closeDroneModalBtn" class="close-btn">&times;</button>
-            </div>
-            <form id="droneUploadForm">
-                <p class="form-desc">Upload aerial drone/UAV imagery of open-pit bench walls. The PyTorch Deep CNN will evaluate surface micro-fracturing, tension crack density, and rockfall risk.</p>
-                <div class="upload-dropzone" style="border-color: #a855f7;">
-                    <input type="file" id="droneFileInput" accept="image/*" required>
-                    <div class="dropzone-text">
-                        <span class="upload-icon">📸</span>
-                        <span>Click to browse or drop Aerial Drone Image (JPG / PNG)</span>
-                    </div>
-                </div>
-                <div id="droneResult" class="upload-result hidden" style="background: rgba(168, 85, 247, 0.15); border-color: #a855f7; color: #e9d5ff; white-space: pre-line;"></div>
-                <div class="modal-footer">
-                    <button type="button" id="cancelDroneBtn" class="btn btn-secondary">Cancel</button>
-                    <button type="submit" class="btn btn-primary" style="background: #a855f7; border: none;">Run CNN Vision Analysis</button>
-                </div>
-            </form>
-        </div>
-    </div>
-
-    <script src="app.js?v=6.0.0"></script>
 </body>
 </html>

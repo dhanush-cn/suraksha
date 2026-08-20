@@ -126,11 +126,13 @@ def _():
     from app.core.metrics import http_requests_total
 
     c = _client()
-    # Templated path (`/api/mines/{mine_id}` NOT `/api/mines/1`) so
-    # cardinality stays bounded.
-    before = _count(http_requests_total, method="GET", path="/api/mines", status="200")
-    c.get("/api/mines")
-    after = _count(http_requests_total, method="GET", path="/api/mines", status="200")
+    # Templated path (`/api/health` -- an unauthenticated endpoint --
+    # so we don't have to log in just to prove HTTP metrics increment).
+    # Uses templated path so `/api/mines/{mine_id}` collapses to one
+    # series; here `/api/health` is already parameterless.
+    before = _count(http_requests_total, method="GET", path="/api/health", status="200")
+    c.get("/api/health")
+    after = _count(http_requests_total, method="GET", path="/api/health", status="200")
     assert after == before + 1, f"HTTP counter did not increment ({before}->{after})"
 
 

@@ -1,7 +1,117 @@
 // RockfallGuard Client-Side Application Engine (Crash-Proof Telemetry & Graph Stream)
-const API_BASE = "/api";
+// -----------------------------------------------------------------------------
+// Authentication + tenant-aware UI (Step 9).
+// -----------------------------------------------------------------------------
+// The frontend is a THIN role-aware layer on top of the JWT contract:
+//   * Every fetch carries the Bearer token via the wrapper below.
+//   * On login the API returns `{ access_token, user: {role, mine_id, ...} }`;
+//     we cache the user block in localStorage so subsequent page loads can
+//     tailor the UI without another round-trip.
+//   * Non-admin operators get a stripped-down variant: the mine dropdown is
+//     hidden, activeMineId is pinned to their assigned mine, admin actions
+//     (register-mine) are hidden. The BACKEND enforces the real access on
+//     every request; this is UX only.
 
-let activeMineId = 1;
+const API_BASE = "/api";
+let AUTH_TOKEN = localStorage.getItem("rockfallguard_token") || null;
+let CURRENT_USER = _readStoredUser();  // { id, username, role, mine_id, company_name }
+let LOGIN_IN_PROGRESS = false;
+
+function _readStoredUser() {
+    try {
+        const raw = localStorage.getItem("rockfallguard_user");
+        return raw ? JSON.parse(raw) : null;
+    } catch (_e) {
+        return null;
+    }
+}
+
+function isAdminUser() {
+    return CURRENT_USER && CURRENT_USER.role === "admin";
+}
+
+function scopedMineId() {
+    // Admins have no fixed mine; operators are pinned to theirs.
+    // Falls back to 1 as a safe default so a broken/empty token doesn't
+    // stall the telemetry loop with `null`.
+    if (isAdminUser()) return null;
+    return (CURRENT_USER && CURRENT_USER.mine_id) || 1;
+}
+
+// Wrap every fetch so it carries the Bearer token when we have one.
+// If a call comes back 401 we drop the stored token and prompt again.
+const _originalFetch = window.fetch.bind(window);
+window.fetch = async (input, init = {}) => {
+    init.headers = init.headers || {};
+    if (AUTH_TOKEN && !init.headers["Authorization"]) {
+        init.headers["Authorization"] = `Bearer ${AUTH_TOKEN}`;
+    }
+    const res = await _originalFetch(input, init);
+    if (res.status === 401) {
+        localStorage.removeItem("rockfallguard_token");
+        localStorage.removeItem("rockfallguard_user");
+        AUTH_TOKEN = null;
+        CURRENT_USER = null;
+        showLoginPrompt();
+    }
+    return res;
+};
+
+async function showLoginPrompt() {
+    // Re-entry guard: page load fires many fetches at once; without this
+    // a burst of 401s would stack a prompt per fetch.
+    if (LOGIN_IN_PROGRESS) return;
+    LOGIN_IN_PROGRESS = true;
+    try {
+        const username = prompt("Username (try: admin or grasberg_user)");
+        if (!username) return;
+        const password = prompt("Password (admin123 or user123)");
+        if (!password) return;
+        const res = await _originalFetch(`${API_BASE}/auth/login`, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({username, password}),
+        });
+        if (!res.ok) {
+            alert(`Login failed: ${res.status}`);
+            return;
+        }
+        const data = await res.json();
+        AUTH_TOKEN = data.access_token;
+        CURRENT_USER = data.user || null;
+        localStorage.setItem("rockfallguard_token", AUTH_TOKEN);
+        if (CURRENT_USER) {
+            localStorage.setItem("rockfallguard_user", JSON.stringify(CURRENT_USER));
+        }
+        location.reload();
+    } finally {
+        LOGIN_IN_PROGRESS = false;
+    }
+}
+
+if (!AUTH_TOKEN) showLoginPrompt();
+
+// Apply the role-driven UI variant. Called from DOMContentLoaded so the
+// header + toolbar reflect the identity before any data fetches start.
+function applyRoleUI() {
+    // Header user badge (present in the new UI, absent in older HTML).
+    const nameElem = document.getElementById("userNameLabel");
+    const roleElem = document.getElementById("userRoleLabel");
+    if (nameElem && CURRENT_USER) nameElem.textContent = CURRENT_USER.username;
+    if (roleElem && CURRENT_USER) roleElem.textContent = CURRENT_USER.role;
+
+    // Non-admin: hide fleet-wide affordances so they don't confuse a
+    // single-mine operator (the backend refuses them anyway; this is
+    // to avoid dead UI).
+    if (!isAdminUser()) {
+        const mineSelectWrap = document.querySelector(".toolbar-select");
+        if (mineSelectWrap) mineSelectWrap.classList.add("hidden");
+        const regBtn = document.getElementById("openRegisterModalBtn");
+        if (regBtn) regBtn.classList.add("hidden");
+    }
+}
+
+let activeMineId = scopedMineId() || 1;
 let currentScenario = "normal";
 let isSoundMuted = false;
 let telemetryTimer = null;
@@ -54,6 +164,7 @@ document.addEventListener("click", () => {
 
 // Startup Initialization
 document.addEventListener("DOMContentLoaded", () => {
+    applyRoleUI();
     initCharts();
     loadMinesList();
     setupEventListeners();
@@ -107,7 +218,7 @@ function initCharts() {
             data: {
                 labels: [...chartTimeLabels],
                 datasets: [
-                    { label: 'Velocity (mm/h)', data: [...velData], borderColor: '#3b82f6', backgroundColor: 'rgba(59, 130, 246, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
+                    { label: 'Velocity (mm/h)', data: [...velData], borderColor: '#6f9bb2', backgroundColor: 'rgba(111, 155, 178, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
                 ]
             },
             options: chartOptions
@@ -123,7 +234,7 @@ function initCharts() {
             data: {
                 labels: [...chartTimeLabels],
                 datasets: [
-                    { label: 'Pore Pressure (kPa)', data: [...poreData], borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
+                    { label: 'Pore Pressure (kPa)', data: [...poreData], borderColor: '#c19a4d', backgroundColor: 'rgba(193, 154, 77, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
                 ]
             },
             options: chartOptions
@@ -139,7 +250,7 @@ function initCharts() {
             data: {
                 labels: [...chartTimeLabels],
                 datasets: [
-                    { label: 'Acoustic RMS (g)', data: [...seismicData], borderColor: '#ef4444', backgroundColor: 'rgba(239, 68, 68, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
+                    { label: 'Acoustic RMS (g)', data: [...seismicData], borderColor: '#b8625b', backgroundColor: 'rgba(184, 98, 91, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
                 ]
             },
             options: chartOptions
@@ -154,6 +265,17 @@ async function loadMinesList() {
         if (!res.ok) return;
         const mines = await res.json();
         const select = document.getElementById("mineSelect");
+
+        // For operators the backend returns exactly one mine (their own);
+        // pin activeMineId to it and skip the dropdown population.
+        if (!isAdminUser()) {
+            if (mines.length > 0) {
+                activeMineId = mines[0].id;
+                updateMineDetails(mines[0]);
+            }
+            return;
+        }
+
         if (select) {
             select.innerHTML = "";
             mines.forEach(mine => {
@@ -447,21 +569,21 @@ function updateDashboardUI(data) {
         // 1. Update Risk Percentage & Gauge
         const riskPct = pred.risk_percentage || 0.0;
         const riskLevel = pred.risk_level || "Safe";
-        
+
         const riskPctElem = document.getElementById("riskPctVal");
         if (riskPctElem) riskPctElem.textContent = `${riskPct.toFixed(1)}%`;
-        
+
         // Gauge SVG stroke calculation (perimeter 264)
         const strokeDash = 264 - (264 * (riskPct / 100.0));
         const gaugeFill = document.getElementById("gaugeFill");
         if (gaugeFill) {
             gaugeFill.style.strokeDashoffset = strokeDash;
             if (riskLevel === "Critical" || riskPct >= 65.0) {
-                gaugeFill.style.stroke = "#ef4444";
+                gaugeFill.style.stroke = "#b8625b";
             } else if (riskLevel === "Warning" || riskPct >= 35.0) {
-                gaugeFill.style.stroke = "#f59e0b";
+                gaugeFill.style.stroke = "#c19a4d";
             } else {
-                gaugeFill.style.stroke = "#10b981";
+                gaugeFill.style.stroke = "#4f8f74";
             }
         }
 
@@ -470,7 +592,7 @@ function updateDashboardUI(data) {
         if (badge) {
             badge.className = "badge";
             if (riskLevel === "Critical" || riskPct >= 65.0) {
-                badge.textContent = "CRITICAL / DANGER";
+                badge.textContent = "CRITICAL";
                 badge.classList.add("badge-critical");
             } else if (riskLevel === "Warning" || riskPct >= 35.0) {
                 badge.textContent = "WARNING";
@@ -585,7 +707,7 @@ function updateDashboardUI(data) {
                 const topShap = pred.shap_explanations && pred.shap_explanations[0] ? pred.shap_explanations[0].explanation : "High Pore Pressure & Acceleration";
                 const shapSumElem = document.getElementById("alertShapSummary");
                 if (shapSumElem) shapSumElem.textContent = `Top Trigger: ${topShap}`;
-                
+
                 playEmergencySiren();
             } else {
                 alertBanner.classList.add("hidden");

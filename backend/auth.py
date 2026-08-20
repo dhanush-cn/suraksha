@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 
 from app.core.config import get_settings
@@ -138,7 +138,10 @@ def issue_login_tokens(user: _SeedUser) -> dict:
 # --------------------------------------------------------------------------
 
 
-async def get_current_principal(token: Optional[str] = Depends(oauth2_scheme)) -> Principal:
+async def get_current_principal(
+    request: Request,
+    token: Optional[str] = Depends(oauth2_scheme),
+) -> Principal:
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -162,7 +165,13 @@ async def get_current_principal(token: Optional[str] = Depends(oauth2_scheme)) -
     from app.core.blocklist import ensure_not_revoked
 
     await ensure_not_revoked(claims["jti"])
-    return Principal.from_claims(claims)
+    principal = Principal.from_claims(claims)
+
+    # Stash on request.state so other deps (rate limiter, logging
+    # context, tenant scope helpers) can find the caller without
+    # having to accept a Principal dep of their own.
+    request.state.principal = principal
+    return principal
 
 
 # RBAC / tenant-isolation helpers. These raise plain HTTPExceptions (rather

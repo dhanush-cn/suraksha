@@ -70,7 +70,7 @@ from app.core.rate_limit import rate_limit_predict_risk, rate_limit_upload_csv
 from app.core.security import decode_token, revocation_ttl_seconds
 from app.core.streams import recent_events, stream_length
 from app.db.models import Mine
-from app.schemas.auth import Principal
+from app.schemas.auth import Principal, TenantScope
 from app.rag.service import ChatService
 from app.services import AlertService, AuthService, MineService, RiskService
 from app.workers.queue import enqueue, get_pool, job_status
@@ -82,7 +82,7 @@ from auth import (
     oauth2_scheme,
 )
 from app.core.redis_client import get_redis
-from database import init_db, get_recent_alerts  # still writes/reads the same SQLite file
+from database import init_db  # legacy sqlite seeder; still writes to the same file the ORM reads
 from simulator import simulator_instance
 from weather_service import fetch_open_meteo_weather
 
@@ -411,8 +411,19 @@ async def register_new_mine(
 
 
 @app.get("/api/mines")
-async def list_mines(mines: MineService = Depends(get_mine_service)) -> List[Dict[str, Any]]:
-    return [_mine_to_dict(m) for m in await mines.list_all()]
+async def list_mines(
+    principal: Principal = Depends(get_current_principal),
+    mines: MineService = Depends(get_mine_service),
+) -> List[Dict[str, Any]]:
+    """Scope-filtered list.
+
+    Admin -> every mine. Operator -> only their assigned mine.
+    Auth is required now (was public) because an anonymous caller could
+    otherwise enumerate the fleet and use it as a starting point for
+    tenant-targeted probes.
+    """
+    scope = TenantScope.from_principal(principal)
+    return [_mine_to_dict(m) for m in await mines.list_visible(scope)]
 
 
 @app.delete("/api/mines/{mine_id}")
@@ -441,10 +452,15 @@ async def get_live_weather(lat: float, lon: float) -> Dict[str, Any]:
 @app.post("/api/predict_risk", dependencies=[Depends(rate_limit_predict_risk)])
 async def predict_hazard(
     req: TelemetryPredictionRequest,
+    principal: Principal = Depends(get_current_principal),
     mines: MineService = Depends(get_mine_service),
     alerts: AlertService = Depends(get_alert_service),
     risk: RiskService = Depends(get_risk_service),
 ) -> Dict[str, Any]:
+    # Row-level check: an operator can only score sensor frames for
+    # their own mine. Raises TenantAccessDeniedError -> 403 via the
+    # AppError handler when a cross-tenant mine_id is submitted.
+    principal.authorize_mine(req.mine_id)
     input_data = req.model_dump()
     result = risk.predict(input_data)
 
@@ -520,15 +536,38 @@ async def get_mine_live_telemetry(
     }
 
 
-# 5. Alert History Endpoint
+# 5. Alert History Endpoint (scope-filtered)
 #
-# Still reads via the legacy get_recent_alerts because that function
-# returns a JOIN-shaped dict the frontend already consumes; migrating
-# it to AlertRepository would require the response-shape change to be
-# coordinated with the UI.
+# Was previously an anonymous read of every mine's alerts via
+# get_recent_alerts. Now auth-required and scope-filtered so an
+# operator only sees their own mine's history. Response shape is a
+# superset of what the legacy endpoint returned (adds ``mine_id``,
+# drops nothing) so the frontend keeps working unchanged.
 @app.get("/api/alerts")
-def fetch_alerts() -> List[Dict[str, Any]]:
-    return get_recent_alerts(limit=50)
+async def fetch_alerts(
+    limit: int = Query(50, ge=1, le=500),
+    principal: Principal = Depends(get_current_principal),
+    alerts: AlertService = Depends(get_alert_service),
+) -> List[Dict[str, Any]]:
+    scope = TenantScope.from_principal(principal)
+    rows = await alerts.list_recent(scope=scope, limit=limit)
+    return [
+        {
+            "id": a.id,
+            "mine_id": a.mine_id,
+            "mine_name": a.mine.name if a.mine else None,
+            "company": a.mine.company if a.mine else None,
+            "risk_percentage": a.risk_percentage,
+            "risk_level": a.risk_level,
+            "rainfall_mm": a.rainfall_mm,
+            "pore_pressure_kpa": a.pore_pressure_kpa,
+            "velocity_mm_h": a.velocity_mm_h,
+            "seismic_rms_g": a.seismic_rms_g,
+            "top_shap_reason": a.top_shap_reason,
+            "triggered_at": a.triggered_at.isoformat() if a.triggered_at else None,
+        }
+        for a in rows
+    ]
 
 
 # Directory the API uses for uploads that get processed by the worker.
@@ -657,8 +696,13 @@ async def rag_chat(
 ):
     from fastapi.responses import StreamingResponse
 
+    # Scope the RAG retrieval: an operator's chat can pull context
+    # only from their own mine's alert embeddings. Enforced in the
+    # SQL WHERE clause so the pgvector search is bounded to visible
+    # rows -- see app/rag/retrieval.py.
+    scope = TenantScope.from_principal(principal)
     return StreamingResponse(
-        chat.stream(req.question),
+        chat.stream(req.question, scope=scope),
         # text/event-stream so a browser EventSource / a curl -N works
         # out of the box. X-Accel-Buffering off so an nginx reverse
         # proxy in front doesn't buffer the stream and defeat the point.

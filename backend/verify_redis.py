@@ -28,7 +28,7 @@ import asyncio
 import os
 import time
 import traceback
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("JWT_SECRET", "a" * 48)
 os.environ.setdefault("DATABASE_URL", "sqlite:///./mines.db")
@@ -108,6 +108,7 @@ def _():
             client = type("_C", (), {"host": "1.2.3.4"})()
             headers = {}
             url = type("_U", (), {"path": "/x"})()
+            state = MagicMock(spec=[])  # no principal -> falls back to IP
 
         with patch("app.core.rate_limit.get_redis", new=_mock_redis_dep(fake)):
             # 3 requests succeed
@@ -139,6 +140,7 @@ def _():
             client = type("_C", (), {"host": "5.6.7.8"})()
             headers = {}
             url = type("_U", (), {"path": "/x"})()
+            state = MagicMock(spec=[])
 
         with patch("app.core.rate_limit.get_redis", new=_mock_redis_dep(fake)):
             await one(FakeRequest())  # spend alpha's token
@@ -159,6 +161,7 @@ def _():
             client = type("_C", (), {"host": "9.9.9.9"})()
             headers = {}
             url = type("_U", (), {"path": "/x"})()
+            state = MagicMock(spec=[])
 
         with patch("app.core.rate_limit.get_redis", new=_mock_redis_dep(None)):
             # Would trip immediately if the limiter enforced during
@@ -189,14 +192,17 @@ def _():
         with patch("app.core.cache.get_redis", new=_mock_redis_dep(fake)):
             payload = {"id": 1, "name": "Grasberg", "alert_threshold_pct": 70.0}
             await set_cached_mine(1, payload)
-            await set_cached_mine_list([payload])
+            # Scope-keyed list cache API (Step 9). "admin" here is just
+            # a stand-in scope hash; the round-trip is what we're
+            # exercising, not scope-filtering itself.
+            await set_cached_mine_list("admin", [payload])
 
             assert await get_cached_mine(1) == payload
-            assert await get_cached_mine_list() == [payload]
+            assert await get_cached_mine_list("admin") == [payload]
 
             await invalidate_mine(1)
             assert await get_cached_mine(1) is None
-            assert await get_cached_mine_list() is None
+            assert await get_cached_mine_list("admin") is None
 
     asyncio.run(go())
 

@@ -101,12 +101,12 @@ class RateLimit:
 def _identify(request: Request) -> str:
     """Return a stable per-caller key from request context.
 
-    Uses the client IP for anonymous endpoints. When endpoints later
-    add auth, wrap this dependency with one that reads
-    ``request.state.principal`` (populated by an auth middleware) and
-    prefers ``user:<id>`` -- rate limiting SHOULD be per-user for
-    authenticated flows to avoid one operator with a shared NAT
-    address starving colleagues.
+    Prefers the authenticated principal's user_id (stashed on
+    ``request.state.principal`` by :func:`backend.auth.get_current_principal`),
+    so an authenticated endpoint throttles per-user -- one operator
+    behind a shared NAT address can't starve colleagues sitting on
+    the same egress IP. Anonymous endpoints fall through to the
+    client IP.
 
     Falls back to a fixed string when the client IP is unavailable
     (a proxy hiding both ``request.client`` and ``X-Forwarded-For``
@@ -114,6 +114,10 @@ def _identify(request: Request) -> str:
     throttles the whole system rather than letting abuse through
     unbounded).
     """
+    principal = getattr(request.state, "principal", None)
+    if principal is not None and getattr(principal, "user_id", None):
+        return f"user:{principal.user_id}"
+
     ip = None
     if request.client is not None:
         ip = request.client.host

@@ -22,6 +22,7 @@ Design:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from typing import AsyncIterator
@@ -41,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+_engine_loop_id: int | None = None
 
 
 def _normalise_dsn(raw: str) -> str:
@@ -104,8 +106,38 @@ def _build_engine() -> AsyncEngine:
 
 
 def get_engine() -> AsyncEngine:
-    """Return the process-wide async engine, building it on first call."""
-    global _engine, _session_factory
+    """Return the process-wide async engine, building it on first call.
+
+    Detects a stale engine bound to a closed event loop (happens in
+    tests where multiple ``asyncio.run(...)`` blocks share a module,
+    and in starlette TestClient which spins up a fresh loop per
+    request) by comparing the current loop's id against the one the
+    engine was built on. Same trick :mod:`app.workers.queue` uses;
+    a no-op in production under a single uvicorn loop.
+    """
+    global _engine, _session_factory, _engine_loop_id
+    try:
+        current_loop_id: int | None = id(asyncio.get_running_loop())
+    except RuntimeError:
+        # No running loop -- e.g. someone called this synchronously.
+        # Keep whatever we have; a subsequent call from within a loop
+        # will pick up the loop-id check.
+        current_loop_id = None
+
+    if (
+        _engine is not None
+        and current_loop_id is not None
+        and _engine_loop_id is not None
+        and _engine_loop_id != current_loop_id
+    ):
+        # Drop the reference; the old loop is gone, its connections
+        # will be GC'd. Not aclose() -- awaiting inside a sync call
+        # is the wrong shape and the loop is dead anyway.
+        logger.debug("resetting stale async engine from prior event loop")
+        _engine = None
+        _session_factory = None
+        _engine_loop_id = None
+
     if _engine is None:
         _engine = _build_engine()
         _session_factory = async_sessionmaker(
@@ -117,6 +149,7 @@ def get_engine() -> AsyncEngine:
             expire_on_commit=False,
             class_=AsyncSession,
         )
+        _engine_loop_id = current_loop_id
     return _engine
 
 
@@ -153,11 +186,12 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 
 async def dispose_engine() -> None:
     """Close the pool. Call from FastAPI shutdown or test teardown."""
-    global _engine, _session_factory
+    global _engine, _session_factory, _engine_loop_id
     if _engine is not None:
         await _engine.dispose()
         _engine = None
         _session_factory = None
+        _engine_loop_id = None
 
 
 def reset_engine_for_tests() -> None:
@@ -167,9 +201,10 @@ def reset_engine_for_tests() -> None:
     an ``await`` (module-level pytest fixtures). Production code should
     always use :func:`dispose_engine`.
     """
-    global _engine, _session_factory
+    global _engine, _session_factory, _engine_loop_id
     _engine = None
     _session_factory = None
+    _engine_loop_id = None
 
 
 __all__ = [

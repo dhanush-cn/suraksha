@@ -29,6 +29,8 @@ from typing import Sequence
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.schemas.auth import TenantScope
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,9 +56,17 @@ async def top_k_similar(
     session: AsyncSession,
     query_embedding: Sequence[float],
     k: int,
+    scope: TenantScope,
 ) -> list[RetrievedAlert]:
     """Return the K most similar alerts by cosine distance, or an empty
     list on SQLite (no pgvector) or on any error.
+
+    Scope-filtered: an operator's chat cannot retrieve context from
+    another mine's alerts. Filter runs INSIDE the SQL WHERE so the
+    pgvector search is bounded to visible rows -- filtering after the
+    fact would let another mine's row rank #1 and get sent to the LLM
+    even if we then dropped it, wasting tokens and risking a leak
+    through prompt-injection edge cases.
 
     Empty list on error is a deliberate choice: retrieval failure
     should not fail the whole chat request. ChatService detects the
@@ -78,10 +88,17 @@ async def top_k_similar(
     # literal path works with asyncpg, psycopg, and psycopg2 without
     # any codec setup and costs a few bytes of extra wire traffic --
     # negligible next to the vector payload itself.
+    # Scope filter: an admin sees every alert's embedding; an operator
+    # sees only their own mine's. Enforced at the JOIN so pgvector's
+    # HNSW index still gets a bounded row set to search.
     stmt = text(
         """
-        SELECT alert_id, source_text, embedding <=> CAST(:query AS vector) AS distance
-        FROM alert_embeddings
+        SELECT ae.alert_id,
+               ae.source_text,
+               ae.embedding <=> CAST(:query AS vector) AS distance
+        FROM alert_embeddings ae
+        JOIN alert_logs a ON a.id = ae.alert_id
+        WHERE :is_admin OR a.mine_id = :mine_id
         ORDER BY distance
         LIMIT :k
         """
@@ -90,7 +107,14 @@ async def top_k_similar(
         rows = (
             await session.execute(
                 stmt,
-                {"query": _to_vector_literal(query_embedding), "k": k},
+                {
+                    "query": _to_vector_literal(query_embedding),
+                    "k": k,
+                    "is_admin": scope.is_admin,
+                    # 0 is a safe filler when is_admin=True (never
+                    # compared) but must be an int for the SQL bind.
+                    "mine_id": scope.mine_id if scope.mine_id is not None else 0,
+                },
             )
         ).mappings().all()
     except Exception as exc:  # noqa: BLE001

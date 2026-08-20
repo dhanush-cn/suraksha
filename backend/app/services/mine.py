@@ -22,6 +22,7 @@ from app.core.cache import (
 from app.core.exceptions import NotFoundError
 from app.db.models import Mine
 from app.repositories.mine import MineRepository
+from app.schemas.auth import TenantScope
 
 
 def _deserialise_mine(data: dict[str, Any]) -> Mine:
@@ -68,13 +69,46 @@ class MineService:
         self._repo = MineRepository(session)
 
     async def list_all(self) -> Sequence[Mine]:
-        """Cache-first list. Explicit invalidation on any writer, TTL
-        as a safety net; see :mod:`app.core.cache` for the rationale."""
-        cached = await get_cached_mine_list()
+        """Unscoped list -- INTERNAL use only (workers, admin cache warmup).
+
+        Route handlers MUST call :meth:`list_visible` with a
+        :class:`TenantScope`; this method exists so those internal
+        callers don't need to fake a scope. Cached under the
+        ``admin`` scope-hash slot so it doubles as the admin
+        pre-warm.
+        """
+        return await self.list_visible(TenantScope(is_admin=True, mine_id=None))
+
+    async def list_visible(self, scope: TenantScope) -> Sequence[Mine]:
+        """Cache-first, scope-filtered list of mines the caller may see.
+
+        Two callers, two shapes:
+
+        * Admin -- returns every mine (unfiltered).
+        * Operator -- returns exactly one mine (their assigned one) or
+          an empty list if the assigned mine no longer exists (mine
+          deleted, operator not yet reassigned).
+
+        Cache is per-scope (:meth:`TenantScope.scope_hash`), so the
+        two shapes never contaminate each other.
+        """
+        cached = await get_cached_mine_list(scope.scope_hash())
         if cached is not None:
             return [_deserialise_mine(entry) for entry in cached]
-        mines = list(await self._repo.list_all())
-        await set_cached_mine_list([_serialise_mine(m) for m in mines])
+
+        if scope.is_admin:
+            mines = list(await self._repo.list_all())
+        elif scope.mine_id is not None:
+            one = await self._repo.get(scope.mine_id)
+            mines = [one] if one is not None else []
+        else:
+            # Should never happen -- Principal invariant forbids
+            # non-admin without mine_id -- but fail closed if it does.
+            mines = []
+
+        await set_cached_mine_list(
+            scope.scope_hash(), [_serialise_mine(m) for m in mines]
+        )
         return mines
 
     async def get_or_404(self, mine_id: int) -> Mine:

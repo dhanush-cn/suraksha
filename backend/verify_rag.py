@@ -219,7 +219,12 @@ def _():
             new=lambda self, messages: _async_gen(["one ", "two"]),
         ):
             events: list[dict] = []
-            async for raw in ChatService(session).stream("what happened?"):
+            from app.schemas.auth import TenantScope
+
+            async for raw in ChatService(session).stream(
+                "what happened?",
+                scope=TenantScope(is_admin=True, mine_id=None),
+            ):
                 assert raw.startswith("data: ") and raw.endswith("\n\n")
                 events.append(json.loads(raw[6:].rstrip()))
 
@@ -244,7 +249,11 @@ def _():
 
     async def go():
         events = []
-        async for raw in ChatService(MagicMock()).stream("hi"):
+        from app.schemas.auth import TenantScope
+
+        async for raw in ChatService(MagicMock()).stream(
+            "hi", scope=TenantScope(is_admin=True, mine_id=None)
+        ):
             events.append(json.loads(raw[6:].rstrip()))
         assert events[0]["type"] == "error"
         assert "not configured" in events[0]["error"].lower()
@@ -264,7 +273,14 @@ def _():
     async def go():
         fake_session = MagicMock()
         fake_session.bind.dialect.name = "sqlite"
-        hits = await top_k_similar(session=fake_session, query_embedding=[0.0] * 4, k=5)
+        from app.schemas.auth import TenantScope
+
+        hits = await top_k_similar(
+            session=fake_session,
+            query_embedding=[0.0] * 4,
+            k=5,
+            scope=TenantScope(is_admin=True, mine_id=None),
+        )
         assert hits == []
 
     asyncio.run(go())
@@ -430,10 +446,13 @@ def _():
                     )
 
             async with session_scope() as s:
+                from app.schemas.auth import TenantScope
+
                 hits = await top_k_similar(
                     session=s,
                     query_embedding=[1.0] + [0.0] * 1535,
                     k=3,
+                    scope=TenantScope(is_admin=True, mine_id=None),
                 )
                 hit_ids = [h.alert_id for h in hits]
                 assert hit_ids == [1, 3, 2], (

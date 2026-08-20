@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.rag.client import LLMClient, LLMConfigurationError
 from app.rag.retrieval import RetrievedAlert, top_k_similar
+from app.schemas.auth import TenantScope
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ class ChatService:
         self._session = session
         self._client = client or LLMClient()
 
-    async def stream(self, question: str) -> AsyncIterator[str]:
+    async def stream(self, question: str, *, scope: TenantScope) -> AsyncIterator[str]:
         """Yield the SSE-shaped chunks for one chat request.
 
         Emits, in order:
@@ -96,13 +97,16 @@ class ChatService:
             yield _sse({"type": "error", "error": f"embedding failed: {exc}"})
             return
 
-        # 2. Retrieve top-K. Empty list on SQLite / retrieval outage
-        # is a soft failure -- we still call the LLM, it just tells
-        # the user we don't have grounded context.
+        # 2. Retrieve top-K, scope-filtered so an operator's chat
+        # can never surface another mine's alert history. Empty list
+        # on SQLite / retrieval outage is a soft failure -- we still
+        # call the LLM, it just tells the user we don't have grounded
+        # context.
         retrieved = await top_k_similar(
             session=self._session,
             query_embedding=question_embedding,
             k=settings.rag_top_k,
+            scope=scope,
         )
 
         # 3. Emit metadata FIRST so the client can render "sources"

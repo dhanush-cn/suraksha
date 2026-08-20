@@ -22,9 +22,10 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.streams import publish_emergency_event
-from app.db.models import Mine
+from app.db.models import AlertLog, Mine
 from app.repositories.alert import AlertRepository
 from app.schemas.alert import AlertCreate
+from app.schemas.auth import TenantScope
 from app.schemas.telemetry import RiskLevel
 from app.workers.queue import enqueue
 
@@ -61,6 +62,20 @@ class AlertService:
         """
         threshold = mine.alert_threshold_pct if mine is not None else DEFAULT_THRESHOLD_PCT
         return risk_percentage >= threshold
+
+    async def list_recent(
+        self, *, scope: TenantScope, limit: int = 50
+    ) -> list[AlertLog]:
+        """Scope-filtered alert history.
+
+        Admin gets every mine's alerts, an operator gets only their
+        own -- enforced at the SQL WHERE clause via
+        :meth:`AlertRepository.recent`, not by post-hoc filtering
+        (which would leak sensitive fields into a serialiser layer
+        that later forgets to strip them).
+        """
+        mine_filter = None if scope.is_admin else scope.mine_id
+        return list(await self._repo.recent(limit=limit, mine_id=mine_filter))
 
     async def record(
         self,

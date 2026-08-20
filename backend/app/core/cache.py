@@ -36,11 +36,23 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 _MINE_KEY_PREFIX = "rockfallguard:cache:mine"
-_MINE_LIST_KEY = f"{_MINE_KEY_PREFIX}:list"
+_MINE_LIST_KEY_PREFIX = f"{_MINE_KEY_PREFIX}:list"
 
 
 def _mine_key(mine_id: int) -> str:
     return f"{_MINE_KEY_PREFIX}:{mine_id}"
+
+
+def _mine_list_key(scope_hash: str) -> str:
+    """Per-scope cache key for the mines listing.
+
+    An admin's list-of-all-mines and an operator's list-of-one-mine
+    MUST NOT share a cache entry -- otherwise the first request to
+    warm the cache picks the shape and every subsequent caller of the
+    other role sees the wrong slice. Scope hash comes from
+    :meth:`TenantScope.scope_hash`.
+    """
+    return f"{_MINE_LIST_KEY_PREFIX}:{scope_hash}"
 
 
 async def get_cached_mine(mine_id: int) -> dict[str, Any] | None:
@@ -77,15 +89,17 @@ async def get_cached_mine(mine_id: int) -> dict[str, Any] | None:
         return None
 
 
-async def get_cached_mine_list() -> list[dict[str, Any]] | None:
+async def get_cached_mine_list(scope_hash: str) -> list[dict[str, Any]] | None:
+    """Scope-keyed list cache read. See :func:`_mine_list_key` for why."""
     client = await get_redis()
     if client is None:
         record_cache_miss("mine_list")
         return None
+    key = _mine_list_key(scope_hash)
     try:
-        raw = await client.get(_MINE_LIST_KEY)
+        raw = await client.get(key)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("cache read failed for mine list: %s", exc)
+        logger.warning("cache read failed for mine list (%s): %s", scope_hash, exc)
         record_cache_miss("mine_list")
         return None
     if raw is None:
@@ -97,7 +111,7 @@ async def get_cached_mine_list() -> list[dict[str, Any]] | None:
         return payload
     except (ValueError, TypeError):
         try:
-            await client.delete(_MINE_LIST_KEY)
+            await client.delete(key)
         except Exception:  # noqa: BLE001,S110
             pass
         record_cache_miss("mine_list")
@@ -118,33 +132,46 @@ async def set_cached_mine(mine_id: int, payload: dict[str, Any]) -> None:
         logger.warning("cache write failed for mine %s: %s", mine_id, exc)
 
 
-async def set_cached_mine_list(payload: list[dict[str, Any]]) -> None:
+async def set_cached_mine_list(scope_hash: str, payload: list[dict[str, Any]]) -> None:
     client = await get_redis()
     if client is None:
         return
     try:
         await client.set(
-            _MINE_LIST_KEY,
+            _mine_list_key(scope_hash),
             json.dumps(payload, default=str),
             ex=get_settings().mine_cache_ttl_seconds,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("cache write failed for mine list: %s", exc)
+        logger.warning("cache write failed for mine list (%s): %s", scope_hash, exc)
 
 
 async def invalidate_mine(mine_id: int) -> None:
-    """Drop a single mine and the list -- both are stale after a write."""
+    """Drop a single mine and EVERY scope-keyed list cache.
+
+    The list cache is per-scope now (admin, mine:1, mine:2, ...) so a
+    single DELETE on ``_MINE_LIST_KEY`` wouldn't cover every variant.
+    SCAN the prefix and delete matches -- bounded by tenant count,
+    which is small.
+    """
     client = await get_redis()
     if client is None:
         return
     try:
-        # Pipeline both DELETEs into one round trip; the list is
-        # invalidated together with any single-mine key because
-        # `register` / `delete` / `update` all mutate the list too.
         pipe = client.pipeline()
         pipe.delete(_mine_key(mine_id))
-        pipe.delete(_MINE_LIST_KEY)
         await pipe.execute()
+
+        # Sweep all scope-keyed list caches. SCAN over KEYS to avoid
+        # blocking Redis.
+        cursor = 0
+        pattern = f"{_MINE_LIST_KEY_PREFIX}:*"
+        while True:
+            cursor, batch = await client.scan(cursor=cursor, match=pattern, count=100)
+            if batch:
+                await client.delete(*batch)
+            if cursor == 0:
+                break
     except Exception as exc:  # noqa: BLE001
         logger.warning("cache invalidate failed for mine %s: %s", mine_id, exc)
 
