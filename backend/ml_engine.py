@@ -61,7 +61,16 @@ def predict_rockfall_risk(sensor_input: Dict[str, Any]) -> Dict[str, Any]:
     # 2. Compute Derived Kinematic Features
     hydro_kinematic_index = pore_pressure * velocity
     fracture_instability_index = acceleration * filtered_seismic
-    rain_rolling_6h = float(sensor_input.get("rain_rolling_6h", rainfall * 2.5))
+    # dict.get()'s default only fires when the key is absent -- but
+    # TelemetryPredictionRequest declares rain_rolling_6h as an
+    # Optional field, so a caller that omits it still gets the key
+    # in model_dump() with an explicit None value, and .get() happily
+    # returns that None instead of falling back. Check for None
+    # explicitly to catch both "key missing" and "key present but None".
+    rain_rolling_6h_raw = sensor_input.get("rain_rolling_6h")
+    rain_rolling_6h = float(
+        rain_rolling_6h_raw if rain_rolling_6h_raw is not None else rainfall * 2.5
+    )
     vel_rolling_mean = float(sensor_input.get("vel_rolling_mean", velocity))
     vel_rolling_max = float(sensor_input.get("vel_rolling_max", velocity * 1.2))
     pore_rolling_mean = float(sensor_input.get("pore_rolling_mean", pore_pressure))
