@@ -58,35 +58,97 @@ window.fetch = async (input, init = {}) => {
 };
 
 async function showLoginPrompt() {
-    // Re-entry guard: page load fires many fetches at once; without this
-    // a burst of 401s would stack a prompt per fetch.
-    if (LOGIN_IN_PROGRESS) return;
+    // Re-entry guard: page load fires many fetches at once, so a burst of
+    // 401s would otherwise stack one overlay per fetch and the topmost would
+    // swallow clicks meant for the one beneath. The flag stays set for the
+    // lifetime of the overlay -- a successful sign-in reloads the page, which
+    // clears it.
+    if (LOGIN_IN_PROGRESS || document.getElementById("loginOverlay")) return;
     LOGIN_IN_PROGRESS = true;
-    try {
-        const username = prompt("Username (try: admin or grasberg_user)");
-        if (!username) return;
-        const password = prompt("Password (admin123 or user123)");
-        if (!password) return;
-        const res = await _originalFetch(`${API_BASE}/auth/login`, {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({username, password}),
-        });
-        if (!res.ok) {
-            alert(`Login failed: ${res.status}`);
-            return;
+
+    // An in-page overlay rather than window.prompt(): prompt() blocks the
+    // whole page behind a browser-chrome dialog, is unavailable in embedded
+    // webviews (where it throws outright), and cannot show a validation
+    // error without a second dialog. Access tokens expire after an hour,
+    // so this surfaces mid-session too, not only on first load.
+    const overlay = document.createElement("div");
+    overlay.id = "loginOverlay";
+    overlay.style.cssText = [
+        "position:fixed", "inset:0", "z-index:9999",
+        "display:flex", "align-items:center", "justify-content:center",
+        "background:rgba(2,6,23,0.82)", "backdrop-filter:blur(4px)"
+    ].join(";");
+    overlay.innerHTML = `
+        <form id="loginCard" style="width:min(92vw,360px);padding:1.5rem;border-radius:14px;
+             background:#0f172a;border:1px solid rgba(148,163,184,0.22);
+             box-shadow:0 24px 60px rgba(0,0,0,0.55);font-family:inherit;">
+            <div style="font-size:1.05rem;font-weight:700;color:#e2e8f0;">Sign in</div>
+            <div style="margin-top:0.2rem;font-size:0.82rem;color:#94a3b8;">RockfallGuard operations console</div>
+            <input id="loginUser" autocomplete="username" placeholder="Username" style="
+                 width:100%;margin-top:1.1rem;padding:0.6rem 0.7rem;border-radius:8px;
+                 border:1px solid rgba(148,163,184,0.28);background:#1e293b;color:#e2e8f0;font-size:0.9rem;">
+            <input id="loginPass" type="password" autocomplete="current-password" placeholder="Password" style="
+                 width:100%;margin-top:0.55rem;padding:0.6rem 0.7rem;border-radius:8px;
+                 border:1px solid rgba(148,163,184,0.28);background:#1e293b;color:#e2e8f0;font-size:0.9rem;">
+            <div id="loginError" style="display:none;margin-top:0.6rem;font-size:0.82rem;color:#f87171;"></div>
+            <button id="loginSubmit" type="submit" style="
+                 width:100%;margin-top:0.9rem;padding:0.6rem;border:0;border-radius:8px;
+                 background:#3b82f6;color:#fff;font-weight:600;font-size:0.9rem;cursor:pointer;">Sign in</button>
+            <div style="margin-top:0.85rem;font-size:0.76rem;color:#64748b;line-height:1.5;">
+                Demo accounts: <code style="color:#94a3b8;">admin / admin123</code> (all mines),
+                <code style="color:#94a3b8;">grasberg_user / user123</code> (one tenant).
+            </div>
+        </form>`;
+    document.body.appendChild(overlay);
+
+    const card = overlay.querySelector("#loginCard");
+    const userEl = overlay.querySelector("#loginUser");
+    const passEl = overlay.querySelector("#loginPass");
+    const errEl = overlay.querySelector("#loginError");
+    const btn = overlay.querySelector("#loginSubmit");
+    userEl.focus();
+
+    const fail = (msg) => {
+        errEl.textContent = msg;
+        errEl.style.display = "block";
+        btn.disabled = false;
+        btn.textContent = "Sign in";
+    };
+
+    card.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        errEl.style.display = "none";
+        const username = userEl.value.trim();
+        const password = passEl.value;
+        if (!username || !password) return fail("Enter a username and password.");
+        btn.disabled = true;
+        btn.textContent = "Signing in...";
+        try {
+            // _originalFetch, not the wrapped one: the wrapper would see the
+            // 401 from a bad password and recurse straight back into here.
+            const res = await _originalFetch(`${API_BASE}/auth/login`, {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({username, password}),
+            });
+            if (!res.ok) {
+                return fail(res.status === 401
+                    ? "That username and password did not match."
+                    : `Login failed (${res.status}).`);
+            }
+            const data = await res.json();
+            AUTH_TOKEN = data.access_token;
+            CURRENT_USER = data.user || null;
+            localStorage.setItem("rockfallguard_token", AUTH_TOKEN);
+            if (CURRENT_USER) {
+                localStorage.setItem("rockfallguard_user", JSON.stringify(CURRENT_USER));
+            }
+            overlay.remove();
+            location.reload();
+        } catch (err) {
+            fail(`Network error: ${err.message}`);
         }
-        const data = await res.json();
-        AUTH_TOKEN = data.access_token;
-        CURRENT_USER = data.user || null;
-        localStorage.setItem("rockfallguard_token", AUTH_TOKEN);
-        if (CURRENT_USER) {
-            localStorage.setItem("rockfallguard_user", JSON.stringify(CURRENT_USER));
-        }
-        location.reload();
-    } finally {
-        LOGIN_IN_PROGRESS = false;
-    }
+    });
 }
 
 if (!AUTH_TOKEN) showLoginPrompt();
@@ -451,6 +513,43 @@ function setupEventListeners() {
         }
     });
 
+    // --- Async job helper ------------------------------------------------
+    // /api/upload_csv and /api/analyze_drone_image no longer do the work
+    // inline: they persist the upload, push an arq job and return 202 with
+    // {job_id, poll_url}. Poll that until the worker reports "complete",
+    // then hand back the job's result. If a deployment ever answers with the
+    // finished payload directly (no job_id), pass it straight through.
+    async function awaitJobResult(accepted, onStatus) {
+        if (!accepted || !accepted.job_id) return accepted;
+        const pollUrl = accepted.poll_url || `/api/jobs/${accepted.job_id}`;
+        const deadline = Date.now() + 90000;
+        let ticks = 0;
+        while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 800));
+            const res = await fetch(window.location.origin + pollUrl);
+            if (!res.ok) throw new Error(`job status check failed (${res.status})`);
+            const snap = await res.json();
+            if (snap.status === "complete") {
+                if (snap.success === false) {
+                    throw new Error("the worker raised while running this job");
+                }
+                const result = snap.result || {};
+                if (result.status === "error") {
+                    throw new Error(result.message || "the worker returned an error");
+                }
+                return result;
+            }
+            if (snap.status === "not_found") {
+                throw new Error("job expired before it was collected");
+            }
+            if (snap.status === "unavailable") {
+                throw new Error("queue unreachable - is Redis up and the arq worker running?");
+            }
+            if (onStatus) onStatus(snap.status, ++ticks);
+        }
+        throw new Error("timed out after 90s waiting for the worker");
+    }
+
     // CSV Upload Form Submit
     document.getElementById("csvUploadForm")?.addEventListener("submit", async (e) => {
         e.preventDefault();
@@ -475,8 +574,11 @@ function setupEventListeners() {
                 method: "POST",
                 body: formData
             });
-            const data = await res.json();
+            const accepted = await res.json();
             if (res.ok) {
+                const data = await awaitJobResult(accepted, (state, ticks) => {
+                    resDiv.innerHTML = `\u23f3 Scoring rows on the worker (${state}, ${ticks}s)...`;
+                });
                 resDiv.innerHTML = `
                     <div style="padding: 0.75rem; border-radius: 8px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.4); line-height: 1.6;">
                         <strong style="color: #34d399; font-size: 0.95rem;">✓ Geotechnical Evaluation Complete!</strong><br>
@@ -487,10 +589,10 @@ function setupEventListeners() {
                     </div>
                 `;
             } else {
-                resDiv.innerHTML = `<span style="color: #ef4444;">Error: ${data.detail}</span>`;
+                resDiv.innerHTML = `<span style="color: #ef4444;">Error: ${accepted.detail}</span>`;
             }
         } catch (err) {
-            if (resDiv) resDiv.innerHTML = `<span style="color: #ef4444;">Network Error: ${err.message}</span>`;
+            if (resDiv) resDiv.innerHTML = `<span style="color: #ef4444;">Error: ${err.message}</span>`;
         }
     });
 
@@ -519,21 +621,38 @@ function setupEventListeners() {
                 method: "POST",
                 body: formData
             });
-            const data = await res.json();
+            const accepted = await res.json();
             if (res.ok) {
+                const data = await awaitJobResult(accepted, (state, ticks) => {
+                    resDiv.innerHTML = `\u23f3 Running the CNN on the worker (${state}, ${ticks}s)...`;
+                });
+                const status = data.anomaly_status ?? "unknown";
+                // The note below is not decoration. The model is a terrain
+                // classifier trained on open-pit bounding boxes; without this
+                // line the panel reads like a crack-severity finding, which
+                // is exactly the overclaim MODEL_CARD.md exists to prevent.
+                const note = data.cnn_trained === false
+                    ? `<div style="margin-top:0.5rem;padding:0.4rem 0.6rem;border-radius:6px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.4);color:#fbbf24;font-size:0.85rem;">
+                           No trained weights loaded - ${data.cnn_architecture}. Treat this as plumbing, not a measurement.
+                       </div>`
+                    : `<div style="margin-top:0.5rem;padding:0.4rem 0.6rem;border-radius:6px;background:rgba(148,163,184,0.1);border:1px solid rgba(148,163,184,0.3);color:#94a3b8;font-size:0.8rem;line-height:1.5;">
+                           ${data.caveat ?? ""}
+                       </div>`;
+                const conf = data.mine_region_confidence_pct;
                 resDiv.innerHTML = `
                     <div style="padding: 0.5rem; border-radius: 6px; background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3);">
-                        <strong style="color: #60a5fa;">CNN Visual Classification:</strong> ${data.visual_status}<br>
-                        <strong>Visual Surface Risk:</strong> ${data.visual_risk_percentage}%<br>
-                        <strong>Crack Density / Anomaly:</strong> ${data.crack_severity}<br>
-                        <strong>Recommendation:</strong> ${data.recommendation}
+                        <strong style="color: #60a5fa;">Classification:</strong> ${status}<br>
+                        <strong>Mine-terrain confidence:</strong> ${conf}% <span style="color:#64748b;">(threshold ${data.decision_threshold})</span><br>
+                        <strong>Edge gradient intensity:</strong> ${data.edge_gradient_intensity} <span style="color:#64748b;">(texture statistic, not a model output)</span><br>
+                        <strong>Next step:</strong> ${data.recommendation}
+                        ${note}
                     </div>
                 `;
             } else {
-                resDiv.innerHTML = `<span style="color: #ef4444;">Error: ${data.detail}</span>`;
+                resDiv.innerHTML = `<span style="color: #ef4444;">Error: ${accepted.detail}</span>`;
             }
         } catch (err) {
-            if (resDiv) resDiv.innerHTML = `<span style="color: #ef4444;">Network Error: ${err.message}</span>`;
+            if (resDiv) resDiv.innerHTML = `<span style="color: #ef4444;">Error: ${err.message}</span>`;
         }
     });
 }

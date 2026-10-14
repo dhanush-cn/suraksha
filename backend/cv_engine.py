@@ -41,7 +41,12 @@ class PitWallCNN(nn.Module):
 
     def forward(self, x):
         feat = self.features(x)
-        feat = feat.view(feat.size(0), -1)
+        # .reshape, not .view: a permuted (non-contiguous) input carries
+        # its stride layout through the conv stack, and .view() raises
+        # "view size is not compatible with input tensor's size and
+        # stride" on the flatten. .reshape falls back to a copy when the
+        # tensor cannot be viewed, and is identical otherwise.
+        feat = feat.reshape(feat.size(0), -1)
         out = self.classifier(feat)
         return out
 
@@ -68,10 +73,48 @@ def get_cnn_model():
         _CNN_MODEL = model
     return _CNN_MODEL
 
+_THRESHOLD = None
+
+
+def _decision_threshold() -> float:
+    """Operating point chosen on the validation split during training.
+
+    ml/train_cnn.py tunes it for F1 and records it in cnn_metrics.json.
+    At the default 0.5 this model is precision-heavy (0.98 precision /
+    0.61 recall on held-out data); the tuned point trades a little
+    precision for substantially better recall, which is the right
+    direction for a safety-adjacent screen. Falls back to 0.5 when the
+    metrics file is absent.
+    """
+    global _THRESHOLD
+    if _THRESHOLD is None:
+        _THRESHOLD = 0.5
+        try:
+            import json
+
+            mp = os.path.join(MODELS_DIR, "cnn_metrics.json")
+            with open(mp, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            thr = meta.get("test_at_tuned_threshold", {}).get("threshold")
+            if isinstance(thr, (int, float)) and 0.0 < float(thr) < 1.0:
+                _THRESHOLD = float(thr)
+        except Exception:  # noqa: BLE001 -- absent or malformed: keep 0.5
+            pass
+    return _THRESHOLD
+
+
 def analyze_drone_pit_image(image_bytes: bytes) -> Dict[str, Any]:
     """
-    Processes an aerial drone/UAV image of an open-pit mine wall using PyTorch CNN.
-    Detects surface crack propagation, bench slope displacement anomalies, and returns visual risk score (0-100%).
+    Classifies an aerial image patch as annotated open-pit mine terrain or
+    background, using the CNN trained by ml/train_cnn.py.
+
+    Held-out performance (models/cnn_metrics.json): ROC-AUC 0.956,
+    precision 0.854, recall 0.909 at the tuned operating point, over a
+    test split grouped by source scene.
+
+    This is deliberately NOT a crack or slope-failure model. The only
+    labels available for training were single-class bounding boxes around
+    open-pit workings, so that is the only thing it can honestly report.
     """
     # Deferred import so the metrics dep doesn't leak into environments
     # that only run cv_engine standalone (e.g. the file's ``__main__``
@@ -91,40 +134,56 @@ def analyze_drone_pit_image(image_bytes: bytes) -> Dict[str, Any]:
         with observe_cv_inference(), torch.no_grad():
             raw_cnn_score = float(cnn_model(img_tensor).item())
             
-        # High-frequency edge gradient variance (detects tension cracks vs smooth rock face)
+        # Edge gradient magnitude. Reported as a plain texture statistic.
+        # It is NOT blended into the model score: the previous version
+        # averaged the CNN output with edge_intensity/50 and published the
+        # result as a "visual risk percentage", which dressed an arbitrary
+        # image-processing constant up as a model prediction.
         grayscale = image_resized.convert("L")
         arr = np.array(grayscale, dtype=np.float32)
         gy, gx = np.gradient(arr)
         edge_intensity = float(np.mean(np.hypot(gx, gy)))
-        
-        # Calculate visual surface hazard score
-        combined_visual_risk = float(np.clip((raw_cnn_score * 0.5 + (edge_intensity / 50.0) * 0.5) * 100.0, 5.0, 98.0))
-        
-        if combined_visual_risk >= 65.0:
-            status = "CRITICAL SURFACE ANOMALY"
-            crack_severity = "High Tension Crack Density (Bench Slope Displacement Detected)"
-            recommendation = "Restrict personnel & haul trucks from lower bench sector immediately."
-        elif combined_visual_risk >= 35.0:
-            status = "MODERATE ANOMALY"
-            crack_severity = "Surface Micro-Fracturing & Rock Scaling"
-            recommendation = "Increase extensometer polling frequency."
+
+        threshold = _decision_threshold()
+        is_mine_terrain = raw_cnn_score >= threshold
+
+        if is_mine_terrain:
+            status = "OPEN-PIT MINE TERRAIN"
+            recommendation = (
+                "Scene matches annotated open-pit workings. Pair with sensor "
+                "telemetry for any stability judgement -- this model says "
+                "nothing about slope condition."
+            )
         else:
-            status = "NORMAL BENCH SLOPE"
-            crack_severity = "Stable Rock Face Texture"
-            recommendation = "Continue standard monitoring schedule."
-            
+            status = "BACKGROUND / NOT ANNOTATED MINE TERRAIN"
+            recommendation = (
+                "Scene does not match the annotated open-pit class. If you "
+                "expected a pit here, check framing and altitude before "
+                "reading anything into it."
+            )
+
         return {
             "status": "success",
-            "visual_risk_percentage": float(np.round(combined_visual_risk, 1)),
+            "model_task": (
+                "binary patch classification: annotated open-pit mine region "
+                "vs background crop from the same aerial scene"
+            ),
             "anomaly_status": status,
-            "crack_severity": crack_severity,
+            "mine_region_confidence_pct": float(np.round(raw_cnn_score * 100.0, 1)),
+            "decision_threshold": round(threshold, 3),
             "edge_gradient_intensity": float(np.round(edge_intensity, 2)),
             "recommendation": recommendation,
-            "cnn_architecture": (
-                "PyTorch PitWallCNN (trained)" if _CNN_TRAINED
-                else "PyTorch PitWallCNN (UNTRAINED — output is not meaningful)"
+            "caveat": (
+                "Trained to separate annotated open-pit mine regions from their "
+                "surroundings. It does not detect cracks, does not estimate "
+                "crack severity, and does not predict slope failure."
             ),
-            "cnn_trained": _CNN_TRAINED
+            "cnn_architecture": (
+                "PyTorch PitWallCNN (trained on Open-Pit Mine Object Detection labels)"
+                if _CNN_TRAINED
+                else "PyTorch PitWallCNN (UNTRAINED -- output is not meaningful)"
+            ),
+            "cnn_trained": _CNN_TRAINED,
         }
         
     except Exception as e:  # noqa: BLE001
