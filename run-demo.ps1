@@ -61,11 +61,20 @@ Write-Host "[3/3] starting API on http://localhost:8005" -ForegroundColor Cyan
 Write-Host "      dashboard login: admin / admin123" -ForegroundColor Green
 Write-Host "      Ctrl+C to stop" -ForegroundColor DarkGray
 
-# Give uvicorn a moment to bind before the browser opens, so the recording
-# doesn't catch a connection-refused page.
+# Open the dashboard once uvicorn is actually accepting connections.
+# A fixed sleep is not enough: torch + xgboost + shap import slowly on a
+# cold filesystem cache, so a 6s wait landed on ERR_CONNECTION_REFUSED.
 Start-Job -ScriptBlock {
-    Start-Sleep -Seconds 6
-    Start-Process 'http://localhost:8005'
+    for ($i = 0; $i -lt 60; $i++) {
+        Start-Sleep -Seconds 1
+        try {
+            $c = New-Object Net.Sockets.TcpClient
+            $c.Connect('127.0.0.1', 8005)
+            $c.Close()
+            Start-Process 'http://localhost:8005'
+            return
+        } catch { }
+    }
 } | Out-Null
 
 # No --reload: the reloader double-logs startup and watchfiles chatter
