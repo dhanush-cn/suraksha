@@ -22,7 +22,14 @@ JWT blocklist and auth guards take the opposite stance because their
 failure mode is worse.
 """
 
-from __future__ import annotations
+# NOTE: deliberately no `from __future__ import annotations` here.
+# RateLimiter is a callable *instance* used as a FastAPI dependency.
+# Under PEP 563 every annotation in this module becomes a string, and
+# FastAPI cannot resolve `Request` on `RateLimiter.__call__` because it
+# reads `call.__globals__` and an instance has no `__globals__`. The
+# unresolved `request` parameter then degrades to a required *query*
+# parameter, so every request to a rate-limited route fails with
+# 422 {"loc": ["query", "request"]} before the handler ever runs.
 
 import logging
 import time
