@@ -106,11 +106,29 @@ if (-not (Test-Path (Join-Path $repo 'models\drone_cnn_model.pth'))) {
 
 # --- worker ---------------------------------------------------------------
 if ($redisUp -and (Test-Path $arq)) {
+    # Stop any worker from a previous run first. Two workers on one queue is
+    # not an error, but the old one holds the previous cv_engine/ml_engine in
+    # memory, so after retraining a model the stale process keeps answering
+    # with the weights it loaded at startup.
+    $stale = Get-Process -Name arq -ErrorAction SilentlyContinue
+    if ($stale) {
+        Write-Host "[4/4] stopping $($stale.Count) worker(s) from a previous run" -ForegroundColor Yellow
+        $stale | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
     Write-Host "[4/4] starting arq worker in its own window" -ForegroundColor Cyan
     Start-Process -FilePath $arq `
                   -ArgumentList 'app.workers.settings.WorkerSettings' `
                   -WorkingDirectory (Join-Path $repo 'backend')
     Start-Sleep -Seconds 3
+}
+
+# Refuse to start a second API on a port that already has one: uvicorn would
+# fail to bind and the browser would silently keep talking to the old process.
+if (Test-Port 8005) {
+    Write-Host ""
+    Write-Host "Port 8005 is already in use -- close the previous server window first." -ForegroundColor Red
+    return
 }
 
 Write-Host ""

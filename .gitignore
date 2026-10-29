@@ -13,3 +13,23 @@ models/*.pkl
 models/*.pth
 models/metrics.json
 data/*.csv
+
+# virtualenvs
+.venv/
+venv/
+
+# sqlite side files
+*.db-journal
+
+# dataset working dirs (the labelled source lives outside the repo)
+data/annotation/
+data/images/
+data/uploads/
+data/data/
+
+# one-off scaffolding
+commit-fix.ps1
+commit-fix.bat
+finish.ps1
+finish.bat
+*.patch
