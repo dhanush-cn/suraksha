@@ -1,7 +1,7 @@
 # RockfallGuard - Complete Project Overview & Feature Guide
 
 > **System:** Proactive Open-Pit Mine Geological Risk Warning Platform  
-> **Model Accuracy:** 99.50% Holdout Test Accuracy (100% Failure Event Recall)  
+> **Evaluation:** Synthetic benchmark — 0.79 Critical-class recall at 0.38 precision (temporal split). See [MODEL_CARD.md](MODEL_CARD.md).  
 > **Live Web Dashboard:** [http://127.0.0.1:8009](http://127.0.0.1:8009)
 
 ---
@@ -50,7 +50,7 @@ Open-pit mining involves digging giant, deep open-air pits into the earth to ext
 | :--- | :--- |
 | **📊 Live Risk Score Gauge** | Displays real-time 0–100% failure probability graphs and gauge updates every second. |
 | **🔍 SHAP Explainable AI** | Explains physical root causes behind risk spikes (e.g. *"+2.31 Acoustic Fracture Acceleration"*). |
-| **🛸 Drone Photo Scanning** | PyTorch Deep Learning CNN (`PitWallCNN` trained on 4,617 Kaggle images) inspects aerial drone photos for rock cracks. |
+| **🛸 Drone Photo Scanning** | PyTorch Deep Learning CNN (`PitWallCNN`) inspects aerial drone photos for rock cracks. ⚠️ *Requires trained weights — see [MODEL_CARD.md](MODEL_CARD.md).* |
 | **🗺️ Interactive GPS Map** | Live OpenStreetMap satellite pin centered on the mine's exact geographic location. |
 | **📱 Emergency Email & SMS** | Dispatches automated HTML emails and Twilio SMS text alerts when danger exceeds 80%. |
 | **➕ Register & Delete Mines** | Add new pit mines with GPS coordinates & alert thresholds, or click `🗑️ Delete` to remove old ones. |
@@ -65,7 +65,7 @@ Open-pit mining involves digging giant, deep open-air pits into the earth to ext
 | **Frontend UI** | HTML5, Vanilla CSS3 (Glassmorphism), JavaScript (ES6+), Chart.js, Leaflet.js |
 | **Backend API** | Python 3.14, FastAPI, Uvicorn |
 | **Machine Learning** | XGBoost, LightGBM, Scikit-Learn, SHAP, Butterworth SciPy Filters, SMOTE |
-| **Deep Learning Vision** | PyTorch, torchvision (`PitWallCNN` trained on 4,617 Kaggle drone images) |
+| **Deep Learning Vision** | PyTorch, torchvision (`PitWallCNN` — requires training; see [MODEL_CARD.md](MODEL_CARD.md)) |
 | **Database** | SQLite3 (`mines.db`) |
 | **Cache & Pub/Sub** | Redis 7 (Sub-10ms weather TTL caching) |
 | **Notifications** | SMTP HTML Email + Twilio SMS Gateway (`backend/.env`) |
@@ -73,12 +73,33 @@ Open-pit mining involves digging giant, deep open-air pits into the earth to ext
 
 ---
 
-## 5. Model Accuracy & Results 📈
+## 5. Model Evaluation 📈
 
-- **Holdout Test Set Accuracy**: **99.50%** (exceeds >95% requirement)
-- **5-Fold Cross-Validation Accuracy**: **99.83%**
-- **Critical Failure Event Recall**: **100.0%** (Zero missed slope collapses)
-- **False Alarm Rate**: **0.17%** (Machinery noise filtered out)
+> **Important:** The risk model is trained and evaluated on **synthetic data** generated
+> by `ml/train_model.py`. These metrics measure how well the model recovers a known
+> generating function — they are **not** a claim about real-world rockfall prediction.
+> See [MODEL_CARD.md](MODEL_CARD.md) for full methodology and limitations.
+
+| Metric | Value | What it means |
+| :--- | :--- | :--- |
+| **Critical recall** | **0.79** | Caught ~79% of simulated failure states |
+| **Critical precision** | **0.38** | Under half of Critical alarms were genuine |
+| **Critical PR-AUC** | **0.63** | Area under the precision-recall curve |
+| **Overall accuracy** | **0.91** | **Do not quote alone** — see note below |
+| **Risk regressor MAE** | **3.25 pct-pts** | Continuous risk score error |
+
+**Why is accuracy listed last?** With ~3% Critical-class prevalence, a model that
+always predicts "Safe" scores above 90% accuracy while catching zero failures.
+The number that matters for a safety system is **Critical recall** — what fraction
+of genuine failures were caught.
+
+**Why is precision only 0.38?** Deliberate. The decision threshold is tuned down
+on a validation set to favour recall, because missing a failure can kill someone
+while a false alarm costs an evacuation. Alert fatigue from false alarms is the
+real operational risk to manage.
+
+**Split strategy:** Temporal per-site (earliest 68% train → next 12% validation →
+latest 20% test). Random splits leak on time-series data and inflate every metric.
 
 ---
 

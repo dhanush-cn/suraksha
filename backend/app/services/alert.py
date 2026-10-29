@@ -1,0 +1,212 @@
+"""Alert service -- the one place that decides whether an alert fires.
+
+Collapses the two divergent "should we alert?" branches that used to
+live in main.py:
+
+* ``/api/predict_risk`` hardcoded ``if risk_pct >= 60.0`` -- an alert
+  fires at 60% regardless of what the mine operator configured.
+* ``/api/telemetry`` used ``target_mine.get("alert_threshold_pct", 70.0)``
+  -- respected per-mine configuration.
+
+Two endpoints, one sensor reading, two different outcomes depending on
+which route saw it. :meth:`should_trigger` is now the only decision;
+both handlers route through it, so the mine's configured threshold
+always wins.
+"""
+
+from __future__ import annotations
+
+import time
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.redis_client import get_redis
+from app.core.streams import publish_emergency_event
+from app.db.models import AlertLog, Mine
+from app.repositories.alert import AlertRepository
+from app.schemas.alert import AlertCreate
+from app.schemas.auth import TenantScope
+from app.schemas.telemetry import RiskLevel
+from app.workers.queue import enqueue
+
+# Hard floor: even a mine with no threshold configured (legacy row,
+# migration in flight) must never sit above this without alerting. Set
+# equal to the historical ``alert_threshold_pct`` column default so
+# behaviour is unchanged for correctly-configured mines.
+DEFAULT_THRESHOLD_PCT = 70.0
+
+# One recorded + dispatched alert per mine per window. The dashboard polls
+# telemetry every second, so a mine sitting above threshold used to write
+# an alert_logs row, enqueue an embedding job and enqueue an email/SMS
+# dispatch EVERY SECOND -- 3,600 audit rows and 3,600 dispatch attempts an
+# hour for one ongoing event. The banner still shows on every frame; only
+# the side effects are rate-limited. (The dispatch worker's idempotency key
+# is per minute bucket *and* per risk value, so it never deduplicated
+# these: the risk percentage differs on every frame.)
+ALERT_COOLDOWN_SECONDS = 60
+_COOLDOWN_KEY_PREFIX = "rockfallguard:alert:cooldown"
+# Used only while Redis is unreachable, so a dev box without Redis gets
+# the same behaviour. Per-process, which is fine for that case.
+_local_cooldowns: dict[int, float] = {}
+
+
+class TelemetryFrame(dict):
+    """Type marker for the sensor-frame dict simulator produces.
+
+    Kept as a dict subclass rather than a Pydantic model to avoid
+    forcing every caller through validation on the hot path -- the
+    simulator's output is already schema-shaped. The alias makes call
+    sites read as "this is a telemetry frame, not just any dict".
+    """
+
+
+class AlertService:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+        self._repo = AlertRepository(session)
+
+    @staticmethod
+    def should_trigger(risk_percentage: float, mine: Mine | None) -> bool:
+        """Single source of truth for the alert threshold.
+
+        Uses the mine's configured ``alert_threshold_pct`` when a mine
+        is supplied, else falls back to :data:`DEFAULT_THRESHOLD_PCT`
+        (matches the historical column default so no configured mine's
+        behaviour changes).
+        """
+        threshold = mine.alert_threshold_pct if mine is not None else DEFAULT_THRESHOLD_PCT
+        return risk_percentage >= threshold
+
+    @staticmethod
+    async def claim_alert_slot(
+        mine_id: int, *, cooldown_seconds: int = ALERT_COOLDOWN_SECONDS
+    ) -> bool:
+        """True if this caller should record + dispatch an alert now.
+
+        ``SET NX EX`` in Redis, so with several API workers exactly one of
+        them wins each window. Falls back to an in-process timestamp when
+        Redis is down rather than failing open into the per-second flood.
+        """
+        client = await get_redis()
+        if client is not None:
+            try:
+                acquired = await client.set(
+                    f"{_COOLDOWN_KEY_PREFIX}:{mine_id}",
+                    "1",
+                    ex=cooldown_seconds,
+                    nx=True,
+                )
+                return bool(acquired)
+            except Exception:  # noqa: BLE001 -- fall through to local
+                pass
+        now = time.monotonic()
+        if _local_cooldowns.get(mine_id, 0.0) > now:
+            return False
+        _local_cooldowns[mine_id] = now + cooldown_seconds
+        return True
+
+    async def list_recent(
+        self, *, scope: TenantScope, limit: int = 50
+    ) -> list[AlertLog]:
+        """Scope-filtered alert history.
+
+        Admin gets every mine's alerts, an operator gets only their
+        own -- enforced at the SQL WHERE clause via
+        :meth:`AlertRepository.recent`, not by post-hoc filtering
+        (which would leak sensitive fields into a serialiser layer
+        that later forgets to strip them).
+        """
+        mine_filter = None if scope.is_admin else scope.mine_id
+        return list(await self._repo.recent(limit=limit, mine_id=mine_filter))
+
+    async def record(
+        self,
+        *,
+        mine_id: int,
+        prediction: dict[str, Any],
+        telemetry: dict[str, Any],
+        top_reason: str,
+    ) -> None:
+        """Append to alert_logs (an audit trail, not a source of state).
+
+        Callers pass ``top_reason`` explicitly so the same string used
+        for the dispatch payload appears in the audit row -- keeps
+        "what did we tell the operator?" and "what did we log?" in
+        sync.
+
+        Also fires an ``embed_alert`` job so the new alert becomes
+        searchable via RAG chat within seconds. Best-effort: an
+        embedding failure NEVER blocks the alert being recorded, since
+        the audit trail is the source of truth.
+        """
+        alert = await self._repo.log(
+            mine_id=mine_id,
+            risk_percentage=float(prediction["risk_percentage"]),
+            risk_level=str(prediction["risk_level"]),
+            rainfall_mm=telemetry.get("rainfall_mm"),
+            pore_pressure_kpa=telemetry.get("pore_pressure_kpa"),
+            velocity_mm_h=telemetry.get("velocity_mm_h"),
+            seismic_rms_g=telemetry.get("raw_seismic_rms_g"),
+            top_shap_reason=top_reason,
+        )
+        # Non-fatal enqueue: enqueue() returns None when Redis is
+        # down; the worker skips embedding on non-Postgres or missing
+        # LLM key. Either way the alert is already persisted.
+        await enqueue("embed_alert", int(alert.id))
+
+    async def dispatch(
+        self,
+        *,
+        mine: Mine,
+        prediction: dict[str, Any],
+        top_reason: str,
+    ) -> str | None:
+        """Enqueue the worker's ``dispatch_alert`` job.
+
+        Uses ``AlertCreate.idempotency_key`` so the worker's ``SET NX``
+        lock deduplicates duplicate telemetry frames within the same
+        minute bucket. Returns the job id, or ``None`` if the queue is
+        unreachable -- the alert audit row is already persisted in
+        that case, so ops can re-drive from ``AlertRepository.recent``.
+        """
+        alert_model = AlertCreate(
+            mine_id=mine.id,
+            risk_percentage=float(prediction["risk_percentage"]),
+            risk_level=RiskLevel(str(prediction["risk_level"]).lower()),
+            rainfall_mm=float(prediction.get("rainfall_mm") or 0.0),
+            pore_pressure_kpa=float(prediction.get("pore_pressure_kpa") or 0.0),
+            velocity_mm_h=float(prediction.get("velocity_mm_h") or 0.0),
+            seismic_rms_g=float(prediction.get("seismic_rms_g") or 0.0),
+            top_shap_reason=top_reason,
+            triggered_at=datetime.now(timezone.utc),
+        )
+        payload = {
+            "idempotency_key": alert_model.idempotency_key,
+            "mine_id": mine.id,
+            "mine_name": mine.name,
+            "risk_percentage": alert_model.risk_percentage,
+            "risk_level": prediction["risk_level"],
+            "top_shap_reason": top_reason,
+            "contact_email": mine.contact_email,
+            "contact_phone": mine.contact_phone,
+        }
+        job_id = await enqueue("dispatch_alert", payload)
+
+        # Emit to the emergency stream too: durable, replay-able,
+        # consumed by downstream analytics / WebSocket bridge /
+        # external monitoring. Replaces the old pub/sub channel that
+        # silently dropped messages when nothing was subscribed.
+        # Non-fatal on failure -- the alert row is already in the DB
+        # and the worker was still enqueued.
+        await publish_emergency_event({**payload, "dispatch_job_id": job_id})
+        return job_id
+
+
+__all__ = [
+    "ALERT_COOLDOWN_SECONDS",
+    "AlertService",
+    "DEFAULT_THRESHOLD_PCT",
+    "TelemetryFrame",
+]

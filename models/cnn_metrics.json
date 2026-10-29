@@ -1,0 +1,44 @@
+{
+  "task": "binary patch classification: annotated open-pit mine region vs non-overlapping background crop from the same aerial scene",
+  "not_a_claim_about": [
+    "crack detection or crack severity",
+    "slope failure or rockfall probability",
+    "any image lacking an open-pit mine, which the model has never seen"
+  ],
+  "label_source": "Open-Pit Mine Object Detection Dataset, LabelMe rectangles, single class '1'",
+  "split": "grouped by source image (no scene appears in two splits)",
+  "seed": 1337,
+  "epochs": 8,
+  "selected_on": "validation ROC-AUC",
+  "val_roc_auc": 0.9808,
+  "test_roc_auc": 0.9562,
+  "test_at_tuned_threshold": {
+    "threshold": 0.05,
+    "accuracy": 0.8732,
+    "precision": 0.8543,
+    "recall": 0.9085,
+    "f1": 0.8805,
+    "confusion": {
+      "tp": 129,
+      "fp": 22,
+      "tn": 112,
+      "fn": 13
+    }
+  },
+  "test_at_0.5": {
+    "threshold": 0.5,
+    "accuracy": 0.7899,
+    "precision": 0.9773,
+    "recall": 0.6056,
+    "f1": 0.7478,
+    "confusion": {
+      "tp": 86,
+      "fp": 2,
+      "tn": 132,
+      "fn": 56
+    }
+  },
+  "n_train_crops": 1249,
+  "n_val_crops": 275,
+  "n_test_crops": 276
+}

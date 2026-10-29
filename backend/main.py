@@ -1,40 +1,201 @@
-import os
-import numpy as np
-import shutil
-import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+"""RockfallGuard HTTP API.
 
-from database import init_db, register_mine, get_all_mines, log_alert, get_recent_alerts
-from weather_service import fetch_open_meteo_weather
-from ml_engine import predict_rockfall_risk
+This module is now the thin outermost shell of the app:
+
+* env defaults for local dev (production sets the real values)
+* FastAPI + CORS + startup
+* one exception handler that translates ``AppError`` subclasses raised
+  by services into ``{"detail": "..."}`` responses matching the
+  existing ``HTTPException`` contract
+* route handlers -- each dispatches to a service and shapes the result
+
+Anything that isn't routing lives elsewhere:
+
+* Business rules       -> :mod:`app.services`
+* SQL                  -> :mod:`app.repositories`
+* HTTP auth guards     -> :mod:`backend.auth` (raises HTTPException on
+                          purpose, because auth failures are literally
+                          HTTP-layer identity concerns)
+* Job enqueueing       -> :mod:`app.workers.queue`
+
+Two behaviour-preserving translations from the previous version:
+
+1. **Alert threshold is one rule.** ``AlertService.should_trigger``
+   is the only place. ``/api/predict_risk`` no longer hardcodes 60%;
+   both endpoints now respect the mine's configured threshold.
+
+2. **Top-reason fallback is one string.** ``RiskService.extract_top_reason``
+   owns the SHAP-empty fallback (was two different strings depending on
+   which handler ran).
+"""
+
+import os
+
+# app.core.config.Settings requires JWT_SECRET / DATABASE_URL with no
+# built-in defaults (by design -- a production deployment must set them
+# explicitly). apply_local_dev_defaults only fills a variable that neither
+# the environment nor backend/.env provides, so .env always wins.
+from app.core.config import apply_local_dev_defaults  # noqa: E402
+
+apply_local_dev_defaults()
+
+import asyncio
+import json
+import shutil
+import uuid
+from typing import Any, Dict, List, Optional
+
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from app.api.deps import (
+    get_alert_service,
+    get_auth_service,
+    get_chat_service,
+    get_mine_service,
+    get_risk_service,
+)
+from app.core.blocklist import blocklist_size, revoke
+from app.core.cache import cache_stats
+from app.core.config import get_settings
+from app.core.exceptions import AppError
+from app.core.logging import configure_logging
+from app.core.metrics import record_http_request
+from app.core.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
+from app.core.rate_limit import rate_limit_predict_risk, rate_limit_upload_csv
+from app.core.security import decode_token, revocation_ttl_seconds
+from app.core.streams import recent_events, stream_length
+from app.db.models import Mine
+from app.schemas.auth import Principal, TenantScope
+from app.rag.service import ChatService
+from app.services import AlertService, AuthService, MineService, RiskService
+from app.workers.queue import enqueue, get_pool, job_status
+from app.workers.tasks import DEAD_LETTER_KEY, DEAD_LETTER_MAX_ENTRIES
+from auth import (
+    enforce_admin_only,
+    enforce_tenant_access,
+    get_current_principal,
+    oauth2_scheme,
+)
+from app.core.redis_client import get_redis
+from database import init_db  # legacy sqlite seeder; still writes to the same file the ORM reads
 from simulator import simulator_instance
-from cv_engine import analyze_drone_pit_image
+from weather_service import fetch_open_meteo_weather
+
+# Structured JSON logging with correlation IDs. configure_logging is
+# idempotent (safe to call at import time even under multiple test
+# reloads). Every log line downstream now carries the correlation ID
+# threaded through by RequestContextMiddleware.
+configure_logging(get_settings())
 
 app = FastAPI(
     title="RockfallGuard - Open-Pit Mine Geological Risk Warning API",
     description="Proactive multi-sensor data fusion, weather integration & ML rockfall early warning system.",
-    version="2.0.0"
+    version="2.0.0",
 )
 
-# Enable CORS for local web interface access
+# Correlation ID middleware -- sets X-Request-ID, attaches to logging
+# context, and emits the request-completed structured log line. Added
+# FIRST so its outer try/finally sees every response (middlewares wrap
+# in reverse order of add_middleware calls; the outermost is the one
+# added first here per starlette semantics).
+app.add_middleware(RequestContextMiddleware)
+
+# Reject requests whose declared Content-Length exceeds
+# max_request_body_bytes (default 10MB) BEFORE the handler starts
+# reading the body. Prevents a client from uploading a 5GB file and
+# taking a worker slot for the whole upload just to reject at the row
+# cap. Enforced early = cheap.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=get_settings().max_request_body_bytes)
+
+# CORS comes from settings. It was hardcoded to allow_origins=["*"] with
+# allow_credentials=True, which lets any website a signed-in operator
+# visits make credentialed calls to this API. The dashboard is served
+# from this same origin and needs no CORS at all; a separately hosted
+# frontend lists its origin in CORS_ORIGINS.
+_settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_settings.cors_origin_strings,
+    allow_credentials=_settings.cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Database on Startup
+
+# HTTP-metrics middleware -- Counter + Histogram per (method, templated
+# path, status). Kept as a decorator around each response rather than
+# in the request-context middleware because Prometheus metric labels
+# are strict about the closed-set discipline and we want that in one
+# reviewable place.
+@app.middleware("http")
+async def _prometheus_http_middleware(request, call_next):
+    import time as _time
+
+    from starlette.routing import Match
+
+    start = _time.perf_counter()
+    response = await call_next(request)
+    elapsed = _time.perf_counter() - start
+
+    # Prefer the templated route path (``/api/mines/{mine_id}``) over
+    # request.url.path (``/api/mines/42``) so Prometheus cardinality
+    # stays bounded by route count, not by every path the client hits.
+    path_label = request.url.path
+    for route in request.app.routes:
+        try:
+            match, _ = route.matches(request.scope)
+        except Exception:  # noqa: BLE001,S110 -- best effort
+            continue
+        if match == Match.FULL:
+            path_label = getattr(route, "path", path_label)
+            break
+
+    record_http_request(
+        method=request.method,
+        path=path_label,
+        status=response.status_code,
+        elapsed_s=elapsed,
+    )
+    return response
+
+# Initialize the database eagerly at import time (not only via the startup
+# event): init_db() is idempotent (CREATE TABLE IF NOT EXISTS), and
+# starlette's TestClient only runs lifespan/startup handlers when used
+# as a context manager. backend/tests/test_app.py instantiates
+# TestClient at module scope without one, so relying solely on the
+# startup event left the schema uncreated under pytest.
+init_db()
+
+
 @app.on_event("startup")
-def on_startup():
+def on_startup() -> None:
     init_db()
 
-# Pydantic Schemas
+
+# --- AppError -> HTTPException-shape translator ---------------------------
+#
+# Services raise ``AppError`` subclasses (NotFoundError, ConflictError,
+# PermissionDeniedError, ...). We map them to a JSONResponse with the
+# same ``{"detail": "..."}`` shape FastAPI's HTTPException produces --
+# tests already assert on this shape and the frontend consumes it, so
+# switching to the fancier envelope from app.core.error_handlers would
+# be a breaking change for callers.
+@app.exception_handler(AppError)
+async def _app_error_handler(_request: Request, exc: AppError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.message},
+        headers=exc.headers or None,
+    )
+
+
+# --- Request/response models used only by this module --------------------
+
+
 class MineRegistrationRequest(BaseModel):
     name: str = Field(..., example="Grasberg Copper Pit")
     company: str = Field(..., example="Freeport Mining")
@@ -45,7 +206,10 @@ class MineRegistrationRequest(BaseModel):
     slope_angle_deg: float = Field(default=48.0)
     contact_email: Optional[str] = Field(default="safety@mine.org")
     contact_phone: Optional[str] = Field(default="+1-555-0199")
-    alert_threshold_pct: float = Field(default=70.0, description="Risk threshold (60-80%) to trigger emergency alert")
+    alert_threshold_pct: float = Field(
+        default=70.0, description="Risk threshold (60-80%) to trigger emergency alert"
+    )
+
 
 class TelemetryPredictionRequest(BaseModel):
     mine_id: int
@@ -58,194 +222,573 @@ class TelemetryPredictionRequest(BaseModel):
     raw_seismic_rms_g: float = 0.02
     rain_rolling_6h: Optional[float] = None
 
-# --- API ENDPOINTS ---
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class ChatRequest(BaseModel):
+    # Cap the question size so an accidental large-paste doesn't
+    # trigger a giant embedding + a huge context window on the LLM.
+    # 4000 chars ~= 1000 tokens, way more than an operator question
+    # normally needs.
+    question: str = Field(..., min_length=1, max_length=4000)
+
+
+def _mine_to_dict(mine: Mine) -> Dict[str, Any]:
+    """Serialise an ORM Mine to the dict shape the frontend already
+    consumes -- same keys as ``database.get_all_mines`` produced."""
+    return {
+        "id": mine.id,
+        "name": mine.name,
+        "company": mine.company,
+        "location_name": mine.location_name,
+        "latitude": mine.latitude,
+        "longitude": mine.longitude,
+        "pit_depth_m": mine.pit_depth_m,
+        "slope_angle_deg": mine.slope_angle_deg,
+        "contact_email": mine.contact_email,
+        "contact_phone": mine.contact_phone,
+        "alert_threshold_pct": mine.alert_threshold_pct,
+        "created_at": mine.created_at.isoformat() if mine.created_at else None,
+    }
+
+
+# --- API ENDPOINTS --------------------------------------------------------
+
 
 @app.get("/api/health")
-def health_check():
-    return {"status": "online", "system": "RockfallGuard Proactive Slope Stability Engine"}
+async def health_check() -> Dict[str, Any]:
+    """Backwards-compatible aggregated healthcheck.
+
+    Preserved because the existing test_app.py + frontend depend on
+    the response shape ``{"status": "online", "redis_connected": bool}``.
+    New callers should prefer ``/health/live`` and ``/health/ready``
+    below for k8s-style probe semantics.
+    """
+    redis_client = await get_redis()
+    return {
+        "status": "online",
+        "system": "RockfallGuard Proactive Slope Stability Engine",
+        "redis_connected": redis_client is not None,
+    }
+
+
+# --- Kubernetes-style probes ---------------------------------------------
+#
+# Liveness: "process is alive". Returns 200 as long as the app can
+# answer HTTP. If this ever fails, the orchestrator restarts the pod.
+# Deliberately does NOT check external dependencies -- a Redis blip
+# should NOT restart a healthy API pod.
+#
+# Readiness: "process is ready to serve traffic". Returns 200 only
+# when the DB and Redis are both reachable. If this fails, the
+# orchestrator drops the pod from the load-balancer target set until
+# it recovers -- no restart, just no new traffic. This is the correct
+# response to a Redis outage: stop taking new work, don't kill the
+# pods that could still serve degraded reads if traffic returned.
+@app.get("/health/live")
+def liveness_probe() -> Dict[str, str]:
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+async def readiness_probe():
+    """503 with which subsystem is down when a dep is unreachable."""
+    import sqlalchemy as _sa
+    from fastapi.responses import JSONResponse as _JSONResponse
+
+    from app.db.engine import get_engine as _db_engine
+
+    checks: Dict[str, str] = {}
+
+    # DB: SELECT 1 through the async engine's own pool.
+    try:
+        engine = _db_engine()
+        async with engine.connect() as conn:
+            await conn.execute(_sa.text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as exc:  # noqa: BLE001
+        checks["db"] = f"error: {exc}"
+
+    # Redis: ping through the async client.
+    redis_client = await get_redis()
+    checks["redis"] = "ok" if redis_client is not None else "unreachable"
+
+    all_ok = all(v == "ok" for v in checks.values())
+    payload = {"status": "ready" if all_ok else "not_ready", "checks": checks}
+    if not all_ok:
+        return _JSONResponse(status_code=503, content=payload)
+    return payload
+
+
+# Prometheus scrape endpoint. Exposes the standard text-format output
+# from every metric defined in app.core.metrics.
+@app.get("/metrics")
+def prometheus_metrics():
+    from fastapi.responses import Response as _Response
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+    return _Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# 0. Authentication
+@app.post("/api/auth/login")
+def login(req: LoginRequest, auth: AuthService = Depends(get_auth_service)) -> Dict[str, Any]:
+    result = auth.login(req.username, req.password)
+    return {
+        "access_token": result.access_token,
+        "token_type": result.token_type,
+        "expires_at": result.expires_at,
+        "user": {
+            "id": result.user_id,
+            "username": result.username,
+            "role": result.role_display,
+            "mine_id": result.mine_id,
+            "company_name": result.company_name,
+        },
+    }
+
+
+# 0b. Logout -- adds the caller's jti to the Redis blocklist for its
+# remaining lifetime. The next request bearing the same token gets 401.
+# Uses raw ``oauth2_scheme`` (not get_current_principal) so we still
+# reach the revoke path even if the token is already blocklisted --
+# double-logout is idempotent, not an error.
+@app.post("/api/auth/logout")
+async def logout(token: Optional[str] = Depends(oauth2_scheme)) -> Dict[str, Any]:
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    from app.core.config import get_settings
+    from app.core.exceptions import TokenExpiredError, TokenInvalidError
+    from app.core.security import TokenType
+
+    try:
+        claims = decode_token(
+            token, settings=get_settings(), expected_type=TokenType.ACCESS
+        )
+    except (TokenExpiredError, TokenInvalidError):
+        # Already unusable; treat as successful revocation.
+        return {"status": "revoked"}
+
+    ttl = revocation_ttl_seconds(claims)
+    ok = await revoke(claims["jti"], ttl_seconds=ttl)
+    if not ok:
+        # Redis is down. Failing 200 here would be a lie -- the token
+        # is not actually revoked and would keep working elsewhere.
+        raise HTTPException(
+            status_code=503,
+            detail="Revocation service unavailable; token was NOT revoked. Retry when Redis is reachable.",
+        )
+    return {"status": "revoked", "expires_in_seconds": ttl}
+
 
 # 1. Mine Registration & Management
 @app.post("/api/mines")
-def register_new_mine(req: MineRegistrationRequest):
-    try:
-        mine_id = register_mine(
-            name=req.name,
-            company=req.company,
-            location_name=req.location_name,
-            latitude=req.latitude,
-            longitude=req.longitude,
-            pit_depth_m=req.pit_depth_m,
-            slope_angle_deg=req.slope_angle_deg,
-            contact_email=req.contact_email,
-            contact_phone=req.contact_phone,
-            alert_threshold_pct=req.alert_threshold_pct
-        )
-        return {"status": "success", "message": f"Mine '{req.name}' successfully registered!", "mine_id": mine_id}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+async def register_new_mine(
+    req: MineRegistrationRequest,
+    principal: Principal = Depends(get_current_principal),
+    mines: MineService = Depends(get_mine_service),
+) -> Dict[str, Any]:
+    enforce_admin_only(principal)
+    mine = await mines.register(
+        name=req.name,
+        company=req.company,
+        location_name=req.location_name,
+        latitude=req.latitude,
+        longitude=req.longitude,
+        pit_depth_m=req.pit_depth_m,
+        slope_angle_deg=req.slope_angle_deg,
+        contact_email=req.contact_email,
+        contact_phone=req.contact_phone,
+        alert_threshold_pct=req.alert_threshold_pct,
+    )
+    return {
+        "status": "success",
+        "message": f"Mine '{mine.name}' successfully registered!",
+        "mine_id": mine.id,
+    }
+
 
 @app.get("/api/mines")
-def list_mines():
-    return get_all_mines()
+async def list_mines(
+    principal: Principal = Depends(get_current_principal),
+    mines: MineService = Depends(get_mine_service),
+) -> List[Dict[str, Any]]:
+    """Scope-filtered list.
+
+    Admin -> every mine. Operator -> only their assigned mine.
+    Auth is required now (was public) because an anonymous caller could
+    otherwise enumerate the fleet and use it as a starting point for
+    tenant-targeted probes.
+    """
+    scope = TenantScope.from_principal(principal)
+    return [_mine_to_dict(m) for m in await mines.list_visible(scope)]
+
+
+@app.delete("/api/mines/{mine_id}")
+async def remove_mine(
+    mine_id: int,
+    principal: Principal = Depends(get_current_principal),
+    mines: MineService = Depends(get_mine_service),
+) -> Dict[str, Any]:
+    enforce_admin_only(principal)
+    await mines.delete(mine_id)  # raises NotFoundError -> 404 via app handler
+    return {"status": "success", "message": f"Mine ID {mine_id} deleted."}
+
 
 # 2. Real-Time Open-Meteo Weather Integration
 @app.get("/api/weather/{lat}/{lon}")
-def get_live_weather(lat: float, lon: float):
-    return fetch_open_meteo_weather(lat, lon)
+async def get_live_weather(lat: float, lon: float) -> Dict[str, Any]:
+    return await fetch_open_meteo_weather(lat, lon)
+
 
 # 3. Predict Hazard Risk & SHAP Explanations
-@app.post("/api/predict_risk")
-def predict_hazard(req: TelemetryPredictionRequest):
-    input_data = req.dict()
-    result = predict_rockfall_risk(input_data)
-    
-    # Check if risk exceeds threshold to auto-log alert
-    risk_pct = result["risk_percentage"]
-    if risk_pct >= 60.0:
-        top_reason = result["shap_explanations"][0]["explanation"] if result["shap_explanations"] else "High Creep Rate"
-        log_alert(
-            mine_id=req.mine_id,
-            risk_percentage=risk_pct,
-            risk_level=result["risk_level"],
-            rainfall_mm=req.rainfall_mm,
-            pore_pressure_kpa=req.pore_pressure_kpa,
-            velocity_mm_h=req.velocity_mm_h,
-            seismic_rms_g=req.raw_seismic_rms_g,
-            top_shap_reason=top_reason
-        )
+#
+# Used to hardcode ``if risk_pct >= 60.0`` -- diverged from the mine-
+# configured threshold. Now routes through AlertService.should_trigger,
+# so a single sensor frame produces the same alert decision regardless
+# of which endpoint saw it. Rate limit: token bucket, per-IP.
+@app.post("/api/predict_risk", dependencies=[Depends(rate_limit_predict_risk)])
+async def predict_hazard(
+    req: TelemetryPredictionRequest,
+    principal: Principal = Depends(get_current_principal),
+    mines: MineService = Depends(get_mine_service),
+    alerts: AlertService = Depends(get_alert_service),
+    risk: RiskService = Depends(get_risk_service),
+) -> Dict[str, Any]:
+    # Row-level check: an operator can only score sensor frames for
+    # their own mine. Raises TenantAccessDeniedError -> 403 via the
+    # AppError handler when a cross-tenant mine_id is submitted.
+    principal.authorize_mine(req.mine_id)
+    input_data = req.model_dump()
+    result = risk.predict(input_data)
+    result["alert_recorded"] = False
+
+    # Look the mine up so its configured threshold wins over any hardcode.
+    # Fall back to None when the request cites a mine that was deleted
+    # since the caller last synced -- we still want to return the risk
+    # score, we just can't record/dispatch without a mine.
+    try:
+        mine = await mines.get_or_404(req.mine_id)
+    except Exception:
+        mine = None
+
+    if alerts.should_trigger(result["risk_percentage"], mine):
+        top_reason = risk.extract_top_reason(result)
+        if mine is not None and await alerts.claim_alert_slot(mine.id):
+            result["alert_recorded"] = True
+            telemetry_view = input_data | {"raw_seismic_rms_g": req.raw_seismic_rms_g}
+            await alerts.record(
+                mine_id=mine.id,
+                prediction=result,
+                telemetry=telemetry_view,
+                top_reason=top_reason,
+            )
     return result
+
 
 # 4. Stream Combined Live Telemetry + Weather + Risk Prediction
 @app.get("/api/telemetry/{mine_id}")
-def get_mine_live_telemetry(mine_id: int, scenario: str = Query("normal")):
-    mines = get_all_mines()
-    target_mine = next((m for m in mines if m["id"] == mine_id), None)
-    if not target_mine:
-        target_mine = mines[0] if mines else {
-            "id": 1, "name": "Default Open Pit Mine", "latitude": -4.05, "longitude": 137.11, "alert_threshold_pct": 70.0
-        }
-        
-    # Fetch real live weather for mine GPS coordinates
-    weather = fetch_open_meteo_weather(target_mine["latitude"], target_mine["longitude"])
-    
-    # Generate sensor telemetry frame for specific mine
-    telemetry = simulator_instance.generate_telemetry_frame(scenario=scenario, weather_data=weather, mine_info=target_mine)
-    
-    # Run ML Inference
-    prediction_input = {**telemetry, "mine_id": mine_id}
-    prediction = predict_rockfall_risk(prediction_input)
-    
-    # Auto log alert if risk exceeds mine threshold (e.g. >60-80%)
-    alert_threshold = target_mine.get("alert_threshold_pct", 70.0)
-    risk_pct = prediction["risk_percentage"]
-    is_alert_triggered = risk_pct >= alert_threshold
-    
-    if is_alert_triggered:
-        top_reason = prediction["shap_explanations"][0]["explanation"] if prediction["shap_explanations"] else "Accelerating Displacement Rate"
-        log_alert(
-            mine_id=mine_id,
-            risk_percentage=risk_pct,
-            risk_level=prediction["risk_level"],
-            rainfall_mm=telemetry["rainfall_mm"],
-            pore_pressure_kpa=telemetry["pore_pressure_kpa"],
-            velocity_mm_h=telemetry["velocity_mm_h"],
-            seismic_rms_g=telemetry["raw_seismic_rms_g"],
-            top_shap_reason=top_reason
+async def get_mine_live_telemetry(
+    mine_id: int,
+    scenario: str = Query("normal"),
+    principal: Principal = Depends(get_current_principal),
+    mines: MineService = Depends(get_mine_service),
+    alerts: AlertService = Depends(get_alert_service),
+    risk: RiskService = Depends(get_risk_service),
+) -> Dict[str, Any]:
+    enforce_tenant_access(principal, mine_id)
+
+    # get_or_404: the previous handler silently fell back to mines[0]
+    # when the requested mine was missing, which could dispatch alerts
+    # against the wrong mine. Now a missing mine is a clean 404.
+    mine = await mines.get_or_404(mine_id)
+    mine_view = _mine_to_dict(mine)
+
+    weather = await fetch_open_meteo_weather(mine.latitude, mine.longitude)
+    telemetry = simulator_instance.generate_telemetry_frame(
+        scenario=scenario, weather_data=weather, mine_info=mine_view
+    )
+
+    prediction = risk.predict({**telemetry, "mine_id": mine_id})
+
+    triggered = alerts.should_trigger(prediction["risk_percentage"], mine)
+    dispatch_job_id: Optional[str] = None
+    # ``triggered`` drives the on-screen banner on every frame; the audit row
+    # and the email/SMS dispatch happen at most once per mine per cooldown
+    # window (see AlertService.claim_alert_slot).
+    recorded = triggered and await alerts.claim_alert_slot(mine.id)
+    if recorded:
+        top_reason = risk.extract_top_reason(prediction)
+        await alerts.record(
+            mine_id=mine.id,
+            prediction=prediction,
+            telemetry=telemetry,
+            top_reason=top_reason,
         )
-        
+        dispatch_job_id = await alerts.dispatch(
+            mine=mine, prediction=prediction, top_reason=top_reason
+        )
+
     return {
-        "mine": target_mine,
+        "mine": mine_view,
         "weather": weather,
         "telemetry": telemetry,
         "prediction": prediction,
-        "alert_triggered": is_alert_triggered,
-        "alert_threshold_pct": alert_threshold
+        "alert_triggered": triggered,
+        "alert_recorded": recorded,
+        "alert_threshold_pct": mine.alert_threshold_pct,
+        "dispatch_job_id": dispatch_job_id,
     }
 
-# 5. Alert History Endpoint
+
+# 5. Alert History Endpoint (scope-filtered)
+#
+# Was previously an anonymous read of every mine's alerts via
+# get_recent_alerts. Now auth-required and scope-filtered so an
+# operator only sees their own mine's history. Response shape is a
+# superset of what the legacy endpoint returned (adds ``mine_id``,
+# drops nothing) so the frontend keeps working unchanged.
 @app.get("/api/alerts")
-def fetch_alerts():
-    return get_recent_alerts(limit=50)
+async def fetch_alerts(
+    limit: int = Query(50, ge=1, le=500),
+    principal: Principal = Depends(get_current_principal),
+    alerts: AlertService = Depends(get_alert_service),
+) -> List[Dict[str, Any]]:
+    scope = TenantScope.from_principal(principal)
+    rows = await alerts.list_recent(scope=scope, limit=limit)
+    return [
+        {
+            "id": a.id,
+            "mine_id": a.mine_id,
+            "mine_name": a.mine.name if a.mine else None,
+            "company": a.mine.company if a.mine else None,
+            "risk_percentage": a.risk_percentage,
+            "risk_level": a.risk_level,
+            "rainfall_mm": a.rainfall_mm,
+            "pore_pressure_kpa": a.pore_pressure_kpa,
+            "velocity_mm_h": a.velocity_mm_h,
+            "seismic_rms_g": a.seismic_rms_g,
+            "top_shap_reason": a.top_shap_reason,
+            "triggered_at": a.triggered_at.isoformat() if a.triggered_at else None,
+        }
+        for a in rows
+    ]
+
+
+# Directory the API uses for uploads that get processed by the worker.
+# Worker pods must be able to read this path (shared volume in prod).
+_UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "../data/uploads")
+
 
 # 6. Upload Custom CSV Dataset for Retraining / Validation
-@app.post("/api/upload_csv")
-async def upload_custom_dataset(file: UploadFile = File(...)):
-    if not file.filename.endswith(".csv"):
+#
+# Enqueued to the arq worker rather than run inline: a 10k-row upload
+# would otherwise freeze the entire event loop until scoring finished.
+# Rate limit: 5 uploads per burst, refill 1 / min per IP -- CSV
+# scoring is expensive, so the cap is intentionally strict.
+@app.post(
+    "/api/upload_csv",
+    status_code=202,
+    dependencies=[Depends(rate_limit_upload_csv)],
+)
+async def upload_custom_dataset(
+    file: UploadFile = File(...),
+    principal: Principal = Depends(get_current_principal),
+) -> Dict[str, Any]:
+    if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
-        
-    upload_dir = os.path.join(os.path.dirname(__file__), "../data")
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, "custom_mine_upload.csv")
-    
+    # Content-Type check: the extension can be spoofed, but so can this
+    # header -- both together raise the bar without pretending to be a
+    # security guarantee. The real check is the worker actually parsing
+    # the bytes as CSV via pandas; anything malformed errors there.
+    # application/octet-stream and an empty type are allowed because that
+    # is what Chrome/Edge on Windows send for .csv when no spreadsheet app
+    # has registered the extension -- rejecting them made the upload fail
+    # with a 415 on a stock Windows laptop.
+    if file.content_type not in {
+        "text/csv",
+        "application/csv",
+        "application/vnd.ms-excel",
+        "text/plain",
+        "application/octet-stream",
+        "",
+        None,
+    }:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported CSV content-type: {file.content_type!r}",
+        )
+
+    os.makedirs(_UPLOAD_DIR, exist_ok=True)
+    file_path = os.path.join(_UPLOAD_DIR, f"csv_{uuid.uuid4().hex}.csv")
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-        
-    try:
-        df = pd.read_csv(file_path)
-        rows, cols = df.shape
-        
-        # Batch evaluate ML risk across rows
-        risk_scores = []
-        safe_count, warn_count, crit_count = 0, 0, 0
-        
-        for _, row in df.iterrows():
-            pred = predict_rockfall_risk(row.to_dict())
-            rp = pred["risk_percentage"]
-            risk_scores.append(rp)
-            if rp >= 65.0:
-                crit_count += 1
-            elif rp >= 35.0:
-                warn_count += 1
-            else:
-                safe_count += 1
-                
-        avg_risk = float(np.mean(risk_scores)) if risk_scores else 0.0
-        max_risk = float(np.max(risk_scores)) if risk_scores else 0.0
-        
-        # Identify top physical driver from columns
-        top_driver = "Accelerated Creep Velocity"
-        if "pore_pressure_kpa" in df.columns and df["pore_pressure_kpa"].mean() > 50.0:
-            top_driver = "Pore Pressure & Hydro-Kinematic Saturation"
-        elif "rainfall_mm" in df.columns and df["rainfall_mm"].mean() > 10.0:
-            top_driver = "Monsoon Rainfall Intensity"
-            
-        return {
-            "status": "success",
-            "message": f"Successfully evaluated '{file.filename}' ({rows} rows, {cols} columns).",
-            "columns": list(df.columns),
-            "total_records": rows,
-            "avg_risk_percentage": round(avg_risk, 1),
-            "max_risk_percentage": round(max_risk, 1),
-            "safe_records": safe_count,
-            "warning_records": warn_count,
-            "critical_records": crit_count,
-            "top_risk_driver": top_driver
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid CSV file format: {str(e)}")
+
+    job_id = await enqueue("score_csv", file_path, file.filename)
+    if job_id is None:
+        # No Redis / no worker (e.g. Docker Desktop isn't running on a dev
+        # laptop). Score inline on a thread instead of failing: the upload
+        # is capped by max_upload_rows and batch scoring skips SHAP, so a
+        # typical file takes well under a second. 200 + the finished result,
+        # which the dashboard already accepts in place of a job id.
+        from app.workers.tasks import _score_csv_sync
+
+        result = await asyncio.to_thread(_score_csv_sync, file_path, file.filename)
+        return JSONResponse(status_code=200, content=result | {"processed": "inline"})
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "poll_url": f"/api/jobs/{job_id}",
+        "filename": file.filename,
+    }
+
 
 # 7. Drone UAV Bench Wall PyTorch CNN Image Analysis Endpoint
-@app.api_route("/api/analyze_drone_image", methods=["GET", "POST"])
-@app.api_route("/api/analyze_drone_image/", methods=["GET", "POST"])
-async def analyze_drone_image_endpoint(file: Optional[UploadFile] = File(None)):
+@app.api_route("/api/analyze_drone_image", methods=["GET", "POST"], status_code=202)
+@app.api_route("/api/analyze_drone_image/", methods=["GET", "POST"], status_code=202)
+async def analyze_drone_image_endpoint(
+    file: Optional[UploadFile] = File(None),
+    principal: Principal = Depends(get_current_principal),
+) -> Dict[str, Any]:
     if file is None:
         raise HTTPException(status_code=400, detail="Please select an image file to upload.")
-    try:
-        contents = await file.read()
-        if not contents or len(contents) < 10:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-        results = analyze_drone_pit_image(contents)
-        return results
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Image processing error: {str(e)}")
+    # Enforce declared content-type up front. PIL will happily open
+    # anything image-shaped, but a client uploading raw PDFs or ZIPs
+    # is either broken or probing -- fail fast either way.
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported image content-type: {file.content_type!r}",
+        )
+    contents = await file.read()
+    if not contents or len(contents) < 10:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    os.makedirs(_UPLOAD_DIR, exist_ok=True)
+    image_path = os.path.join(_UPLOAD_DIR, f"img_{uuid.uuid4().hex}.bin")
+    with open(image_path, "wb") as buffer:
+        buffer.write(contents)
+
+    job_id = await enqueue("analyze_image", image_path)
+    if job_id is None:
+        # Same inline fallback as /api/upload_csv when the queue is down.
+        from app.workers.tasks import _analyze_image_sync
+
+        result = await asyncio.to_thread(_analyze_image_sync, image_path)
+        return JSONResponse(status_code=200, content=result | {"processed": "inline"})
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "poll_url": f"/api/jobs/{job_id}",
+        "filename": file.filename,
+    }
+
+
+# 8. Job Status Polling
+@app.get("/api/jobs/{job_id}")
+async def get_job_status(
+    job_id: str, principal: Principal = Depends(get_current_principal)
+) -> Dict[str, Any]:
+    return await job_status(job_id)
+
+
+# 9. Dead-Letter Queue Inspection (admin only)
+@app.get("/api/dispatch/dead_letter")
+async def get_dispatch_dead_letter(
+    limit: int = Query(50, ge=1, le=DEAD_LETTER_MAX_ENTRIES),
+    principal: Principal = Depends(get_current_principal),
+) -> Dict[str, Any]:
+    enforce_admin_only(principal)
+    pool = await get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Background queue unavailable.")
+    raw_entries = await pool.lrange(DEAD_LETTER_KEY, 0, limit - 1)
+    entries: List[Dict[str, Any]] = []
+    for raw in raw_entries:
+        try:
+            entries.append(json.loads(raw))
+        except (ValueError, TypeError):
+            entries.append({"raw": str(raw), "parse_error": True})
+    return {"count": len(entries), "entries": entries}
+
+
+# 9b. RAG Chat (Alert QA) -- SSE streaming
+#
+# Uses the same token-bucket rate limiter as /api/predict_risk (LLM
+# calls are expensive) and requires authentication so we don't burn
+# tokens on unauthenticated traffic.
+@app.post("/api/chat", dependencies=[Depends(rate_limit_predict_risk)])
+async def rag_chat(
+    req: ChatRequest,
+    principal: Principal = Depends(get_current_principal),
+    chat: ChatService = Depends(get_chat_service),
+):
+    from fastapi.responses import StreamingResponse
+
+    # Scope the RAG retrieval: an operator's chat can pull context
+    # only from their own mine's alert embeddings. Enforced in the
+    # SQL WHERE clause so the pgvector search is bounded to visible
+    # rows -- see app/rag/retrieval.py.
+    scope = TenantScope.from_principal(principal)
+    return StreamingResponse(
+        chat.stream(req.question, scope=scope),
+        # text/event-stream so a browser EventSource / a curl -N works
+        # out of the box. X-Accel-Buffering off so an nginx reverse
+        # proxy in front doesn't buffer the stream and defeat the point.
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# 10. Emergency Stream Inspection (admin)
+#
+# Reads recent entries from the Redis Stream that AlertService.dispatch
+# XADDs to on every triggered alert. Replaces the old pub/sub channel
+# that silently dropped messages when no subscriber was connected.
+@app.get("/api/emergency/events")
+async def get_emergency_events(
+    limit: int = Query(50, ge=1, le=500),
+    principal: Principal = Depends(get_current_principal),
+) -> Dict[str, Any]:
+    enforce_admin_only(principal)
+    events = await recent_events(limit=limit)
+    return {
+        "count": len(events),
+        "stream_length": await stream_length(),
+        "events": events,
+    }
+
+
+# 11. Cache + Blocklist Diagnostics (admin)
+@app.get("/api/ops/diagnostics")
+async def get_ops_diagnostics(
+    principal: Principal = Depends(get_current_principal),
+) -> Dict[str, Any]:
+    enforce_admin_only(principal)
+    return {
+        "cache": await cache_stats(),
+        "blocklist_size": await blocklist_size(),
+        "emergency_stream_length": await stream_length(),
+    }
+
 
 # Mount Frontend Dashboard Static Directory
 frontend_dir = os.path.join(os.path.dirname(__file__), "../frontend")
 if os.path.exists(frontend_dir):
     app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

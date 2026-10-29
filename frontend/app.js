@@ -1,7 +1,214 @@
 // RockfallGuard Client-Side Application Engine (Crash-Proof Telemetry & Graph Stream)
-const API_BASE = "/api";
+// -----------------------------------------------------------------------------
+// Authentication + tenant-aware UI (Step 9).
+// -----------------------------------------------------------------------------
+// The frontend is a THIN role-aware layer on top of the JWT contract:
+//   * Every fetch carries the Bearer token via the wrapper below.
+//   * On login the API returns `{ access_token, user: {role, mine_id, ...} }`;
+//     we cache the user block in localStorage so subsequent page loads can
+//     tailor the UI without another round-trip.
+//   * Non-admin operators get a stripped-down variant: the mine dropdown is
+//     hidden, activeMineId is pinned to their assigned mine, admin actions
+//     (register-mine) are hidden. The BACKEND enforces the real access on
+//     every request; this is UX only.
 
-let activeMineId = 1;
+const API_BASE = "/api";
+let AUTH_TOKEN = localStorage.getItem("rockfallguard_token") || null;
+let CURRENT_USER = _readStoredUser();  // { id, username, role, mine_id, company_name }
+let LOGIN_IN_PROGRESS = false;
+
+function _readStoredUser() {
+    try {
+        const raw = localStorage.getItem("rockfallguard_user");
+        return raw ? JSON.parse(raw) : null;
+    } catch (_e) {
+        return null;
+    }
+}
+
+function isAdminUser() {
+    return CURRENT_USER && CURRENT_USER.role === "admin";
+}
+
+function scopedMineId() {
+    // Admins have no fixed mine; operators are pinned to theirs.
+    // Falls back to 1 as a safe default so a broken/empty token doesn't
+    // stall the telemetry loop with `null`.
+    if (isAdminUser()) return null;
+    return (CURRENT_USER && CURRENT_USER.mine_id) || 1;
+}
+
+// Wrap every fetch so it carries the Bearer token when we have one.
+// If a call comes back 401 we drop the stored token and prompt again.
+const _originalFetch = window.fetch.bind(window);
+window.fetch = async (input, init = {}) => {
+    init.headers = init.headers || {};
+    if (AUTH_TOKEN && !init.headers["Authorization"]) {
+        init.headers["Authorization"] = `Bearer ${AUTH_TOKEN}`;
+    }
+    const res = await _originalFetch(input, init);
+    if (res.status === 401) {
+        localStorage.removeItem("rockfallguard_token");
+        localStorage.removeItem("rockfallguard_user");
+        AUTH_TOKEN = null;
+        CURRENT_USER = null;
+        showLoginPrompt();
+    }
+    return res;
+};
+
+async function showLoginPrompt() {
+    // Re-entry guard: page load fires many fetches at once, so a burst of
+    // 401s would otherwise stack one overlay per fetch and the topmost would
+    // swallow clicks meant for the one beneath. The flag stays set for the
+    // lifetime of the overlay -- a successful sign-in reloads the page, which
+    // clears it.
+    if (LOGIN_IN_PROGRESS || document.getElementById("loginOverlay")) return;
+    LOGIN_IN_PROGRESS = true;
+
+    // An in-page overlay rather than window.prompt(): prompt() blocks the
+    // whole page behind a browser-chrome dialog, is unavailable in embedded
+    // webviews (where it throws outright), and cannot show a validation
+    // error without a second dialog. Access tokens expire after an hour,
+    // so this surfaces mid-session too, not only on first load.
+    const overlay = document.createElement("div");
+    overlay.id = "loginOverlay";
+    overlay.style.cssText = [
+        "position:fixed", "inset:0", "z-index:9999",
+        "display:flex", "align-items:center", "justify-content:center",
+        "background:rgba(2,6,23,0.82)", "backdrop-filter:blur(4px)"
+    ].join(";");
+    overlay.innerHTML = `
+        <form id="loginCard" style="width:min(92vw,360px);padding:1.5rem;border-radius:14px;
+             background:#0f172a;border:1px solid rgba(148,163,184,0.22);
+             box-shadow:0 24px 60px rgba(0,0,0,0.55);font-family:inherit;">
+            <div style="font-size:1.05rem;font-weight:700;color:#e2e8f0;">Sign in</div>
+            <div style="margin-top:0.2rem;font-size:0.82rem;color:#94a3b8;">RockfallGuard operations console</div>
+            <input id="loginUser" autocomplete="username" placeholder="Username" style="
+                 width:100%;margin-top:1.1rem;padding:0.6rem 0.7rem;border-radius:8px;
+                 border:1px solid rgba(148,163,184,0.28);background:#1e293b;color:#e2e8f0;font-size:0.9rem;">
+            <input id="loginPass" type="password" autocomplete="current-password" placeholder="Password" style="
+                 width:100%;margin-top:0.55rem;padding:0.6rem 0.7rem;border-radius:8px;
+                 border:1px solid rgba(148,163,184,0.28);background:#1e293b;color:#e2e8f0;font-size:0.9rem;">
+            <div id="loginError" style="display:none;margin-top:0.6rem;font-size:0.82rem;color:#f87171;"></div>
+            <button id="loginSubmit" type="submit" style="
+                 width:100%;margin-top:0.9rem;padding:0.6rem;border:0;border-radius:8px;
+                 background:#3b82f6;color:#fff;font-weight:600;font-size:0.9rem;cursor:pointer;">Sign in</button>
+            <div style="margin-top:0.85rem;font-size:0.76rem;color:#64748b;line-height:1.5;">
+                Demo accounts: <code style="color:#94a3b8;">admin / admin123</code> (all mines),
+                <code style="color:#94a3b8;">grasberg_user / user123</code> (one tenant).
+            </div>
+        </form>`;
+    document.body.appendChild(overlay);
+
+    const card = overlay.querySelector("#loginCard");
+    const userEl = overlay.querySelector("#loginUser");
+    const passEl = overlay.querySelector("#loginPass");
+    const errEl = overlay.querySelector("#loginError");
+    const btn = overlay.querySelector("#loginSubmit");
+    userEl.focus();
+
+    const fail = (msg) => {
+        errEl.textContent = msg;
+        errEl.style.display = "block";
+        btn.disabled = false;
+        btn.textContent = "Sign in";
+    };
+
+    card.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        errEl.style.display = "none";
+        const username = userEl.value.trim();
+        const password = passEl.value;
+        if (!username || !password) return fail("Enter a username and password.");
+        btn.disabled = true;
+        btn.textContent = "Signing in...";
+        try {
+            // _originalFetch, not the wrapped one: the wrapper would see the
+            // 401 from a bad password and recurse straight back into here.
+            const res = await _originalFetch(`${API_BASE}/auth/login`, {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({username, password}),
+            });
+            if (!res.ok) {
+                return fail(res.status === 401
+                    ? "That username and password did not match."
+                    : `Login failed (${res.status}).`);
+            }
+            const data = await res.json();
+            AUTH_TOKEN = data.access_token;
+            CURRENT_USER = data.user || null;
+            localStorage.setItem("rockfallguard_token", AUTH_TOKEN);
+            if (CURRENT_USER) {
+                localStorage.setItem("rockfallguard_user", JSON.stringify(CURRENT_USER));
+            }
+            overlay.remove();
+            location.reload();
+        } catch (err) {
+            fail(`Network error: ${err.message}`);
+        }
+    });
+}
+
+if (!AUTH_TOKEN) showLoginPrompt();
+
+// Apply the role-driven UI variant. Called from DOMContentLoaded so the
+// header + toolbar reflect the identity before any data fetches start.
+function applyRoleUI() {
+    // Header user badge (present in the new UI, absent in older HTML).
+    const nameElem = document.getElementById("userNameLabel");
+    const roleElem = document.getElementById("userRoleLabel");
+    if (nameElem && CURRENT_USER) nameElem.textContent = CURRENT_USER.username;
+    if (roleElem && CURRENT_USER) roleElem.textContent = CURRENT_USER.role;
+
+    // Non-admin: hide fleet-wide affordances so they don't confuse a
+    // single-mine operator (the backend refuses them anyway; this is
+    // to avoid dead UI).
+    if (!isAdminUser()) {
+        const mineSelectWrap = document.querySelector(".toolbar-select");
+        if (mineSelectWrap) mineSelectWrap.classList.add("hidden");
+        const regBtn = document.getElementById("openRegisterModalBtn");
+        if (regBtn) regBtn.classList.add("hidden");
+        document.querySelectorAll(".admin-only").forEach(el => el.classList.add("hidden"));
+    }
+}
+
+// Turn any FastAPI error body into one readable line. `detail` is a string
+// for HTTPException but a list of {loc, msg} objects for 422 validation
+// errors, which used to render as "Error: [object Object]".
+function describeError(body, status) {
+    const d = body && body.detail;
+    if (typeof d === "string") return d;
+    if (Array.isArray(d)) {
+        return d.map(e => {
+            const field = Array.isArray(e.loc) ? e.loc.filter(x => x !== "body").join(".") : "";
+            return field ? `${field}: ${e.msg}` : e.msg;
+        }).join("; ");
+    }
+    return `Request failed (${status})`;
+}
+
+async function readJsonSafe(res) {
+    try { return await res.json(); } catch (_e) { return null; }
+}
+
+async function signOut() {
+    try {
+        // Revokes the token server-side (Redis blocklist). A 503 here means
+        // Redis is down and the token was NOT revoked; we still clear the
+        // local session, which is the part the user is asking for.
+        await _originalFetch(`${API_BASE}/auth/logout`, {
+            method: "POST",
+            headers: AUTH_TOKEN ? {"Authorization": `Bearer ${AUTH_TOKEN}`} : {},
+        });
+    } catch (_e) { /* offline: fall through */ }
+    localStorage.removeItem("rockfallguard_token");
+    localStorage.removeItem("rockfallguard_user");
+    location.reload();
+}
+
+let activeMineId = scopedMineId() || 1;
 let currentScenario = "normal";
 let isSoundMuted = false;
 let telemetryTimer = null;
@@ -54,10 +261,18 @@ document.addEventListener("click", () => {
 
 // Startup Initialization
 document.addEventListener("DOMContentLoaded", () => {
-    initCharts();
-    loadMinesList();
+    // Event wiring first: if a chart library failed to load, initCharts
+    // used to throw here and take every button on the page down with it.
     setupEventListeners();
+    applyRoleUI();
+    try { initCharts(); } catch (e) { console.error("Chart init failed:", e); }
+    // No token yet: the sign-in overlay is up and every call would 401.
+    // A successful sign-in reloads the page and lands back here.
+    if (!AUTH_TOKEN) return;
+    loadMinesList();
+    loadAlertHistory();
     startTelemetryPolling();
+    setInterval(loadAlertHistory, 15000);
 });
 
 // Seed Initial Chart Points for Continuous Scrolling Line Display
@@ -80,6 +295,10 @@ function seedInitialChartData() {
 // Setup Chart.js Graphs
 function initCharts() {
     seedInitialChartData();
+    if (typeof Chart === "undefined") {
+        console.warn("Chart.js not loaded; live charts disabled");
+        return;
+    }
 
     const chartOptions = {
         responsive: true,
@@ -107,7 +326,7 @@ function initCharts() {
             data: {
                 labels: [...chartTimeLabels],
                 datasets: [
-                    { label: 'Velocity (mm/h)', data: [...velData], borderColor: '#3b82f6', backgroundColor: 'rgba(59, 130, 246, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
+                    { label: 'Velocity (mm/h)', data: [...velData], borderColor: '#6f9bb2', backgroundColor: 'rgba(111, 155, 178, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
                 ]
             },
             options: chartOptions
@@ -123,7 +342,7 @@ function initCharts() {
             data: {
                 labels: [...chartTimeLabels],
                 datasets: [
-                    { label: 'Pore Pressure (kPa)', data: [...poreData], borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
+                    { label: 'Pore Pressure (kPa)', data: [...poreData], borderColor: '#c19a4d', backgroundColor: 'rgba(193, 154, 77, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
                 ]
             },
             options: chartOptions
@@ -139,7 +358,7 @@ function initCharts() {
             data: {
                 labels: [...chartTimeLabels],
                 datasets: [
-                    { label: 'Acoustic RMS (g)', data: [...seismicData], borderColor: '#ef4444', backgroundColor: 'rgba(239, 68, 68, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
+                    { label: 'Acoustic RMS (g)', data: [...seismicData], borderColor: '#b8625b', backgroundColor: 'rgba(184, 98, 91, 0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 3 }
                 ]
             },
             options: chartOptions
@@ -148,12 +367,26 @@ function initCharts() {
 }
 
 // Load Mines List
-async function loadMinesList() {
+let MINES = [];
+
+async function loadMinesList(preferId = null) {
     try {
         const res = await fetch(`${API_BASE}/mines`);
         if (!res.ok) return;
         const mines = await res.json();
+        MINES = mines;
         const select = document.getElementById("mineSelect");
+
+        // For operators the backend returns exactly one mine (their own);
+        // pin activeMineId to it and skip the dropdown population.
+        if (!isAdminUser()) {
+            if (mines.length > 0) {
+                activeMineId = mines[0].id;
+                updateMineDetails(mines[0]);
+            }
+            return;
+        }
+
         if (select) {
             select.innerHTML = "";
             mines.forEach(mine => {
@@ -164,9 +397,16 @@ async function loadMinesList() {
             });
 
             if (mines.length > 0) {
-                activeMineId = mines[0].id;
-                select.value = activeMineId;
-                updateMineDetails(mines[0]);
+                // Keep the current mine selected across reloads of the list
+                // (register / delete); only fall back to the first one when
+                // the current mine is gone.
+                const wanted = preferId ?? activeMineId;
+                const current = mines.find(m => m.id === wanted) || mines[0];
+                activeMineId = current.id;
+                select.value = String(activeMineId);
+                updateMineDetails(current);
+            } else {
+                updateMineDetails(null);
             }
         }
     } catch (err) {
@@ -175,7 +415,13 @@ async function loadMinesList() {
 }
 
 function updateMineDetails(mine) {
-    if (!mine) return;
+    if (!mine) {
+        ["infoCompany", "infoCoords", "infoDepth", "infoThreshold"].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = "—";
+        });
+        return;
+    }
     const companyElem = document.getElementById("infoCompany");
     if (companyElem) companyElem.textContent = `${mine.name} (${mine.company})`;
 
@@ -186,9 +432,21 @@ function updateMineDetails(mine) {
     if (depthElem) depthElem.textContent = `${mine.pit_depth_m}m | ${mine.slope_angle_deg}° Slope`;
 
     const threshElem = document.getElementById("infoThreshold");
-    if (threshElem) threshElem.textContent = `${mine.alert_threshold_pct || 70.0}%`;
+    if (threshElem) threshElem.textContent = `${mine.alert_threshold_pct ?? 70.0}%`;
 
     updateMineMap(mine);
+}
+
+function minePopup(mine, lat, lon) {
+    // Built with textContent: mine names come from the register form, so
+    // interpolating them into bindPopup's HTML string was an XSS sink.
+    const box = document.createElement("div");
+    const b = document.createElement("b");
+    b.textContent = mine.name;
+    box.appendChild(b);
+    box.appendChild(document.createElement("br"));
+    box.appendChild(document.createTextNode(`GPS: ${lat}°, ${lon}°`));
+    return box;
 }
 
 function updateMineMap(mine) {
@@ -196,8 +454,8 @@ function updateMineMap(mine) {
     const mapDiv = document.getElementById("interactiveMineMap");
     if (!mapDiv) return;
 
-    const lat = mine.latitude || -4.05;
-    const lon = mine.longitude || 137.11;
+    const lat = mine.latitude ?? -4.05;
+    const lon = mine.longitude ?? 137.11;
 
     try {
         if (!leafletMap) {
@@ -207,12 +465,12 @@ function updateMineMap(mine) {
                 attribution: '© OpenStreetMap'
             }).addTo(leafletMap);
             leafletMarker = L.marker([lat, lon]).addTo(leafletMap)
-                .bindPopup(`<b>${mine.name}</b><br>GPS: ${lat}°, ${lon}°`)
+                .bindPopup(minePopup(mine, lat, lon))
                 .openPopup();
         } else {
             leafletMap.setView([lat, lon], 9);
             leafletMarker.setLatLng([lat, lon])
-                .bindPopup(`<b>${mine.name}</b><br>GPS: ${lat}°, ${lon}°`)
+                .bindPopup(minePopup(mine, lat, lon))
                 .openPopup();
         }
         setTimeout(() => {
@@ -235,12 +493,8 @@ function setupEventListeners() {
             const normalBtn = document.querySelector('.sim-btn[data-scenario="normal"]');
             if (normalBtn) normalBtn.classList.add("active");
 
-            const res = await fetch(`${API_BASE}/mines`);
-            if (res.ok) {
-                const mines = await res.json();
-                const m = mines.find(x => x.id === activeMineId);
-                if (m) updateMineDetails(m);
-            }
+            const m = MINES.find(x => x.id === activeMineId);
+            if (m) updateMineDetails(m);
 
             seedInitialChartData();
             fetchTelemetryAndPredict();
@@ -273,8 +527,28 @@ function setupEventListeners() {
         dismissBtn.addEventListener("click", () => {
             const banner = document.getElementById("emergencyAlertBanner");
             if (banner) banner.classList.add("hidden");
+            alertDismissed = true;
         });
     }
+
+    document.getElementById("logoutBtn")?.addEventListener("click", signOut);
+
+    // Remove the selected mine (admin only; the API enforces it as well).
+    document.getElementById("deleteMineBtn")?.addEventListener("click", async () => {
+        const mine = MINES.find(m => m.id === activeMineId);
+        if (!mine) return;
+        if (!confirm(`Remove "${mine.name}" and stop monitoring it?`)) return;
+        const res = await fetch(`${API_BASE}/mines/${mine.id}`, { method: "DELETE" });
+        const body = await readJsonSafe(res);
+        if (!res.ok) {
+            alert(`Could not remove the mine: ${describeError(body, res.status)}`);
+            return;
+        }
+        await loadMinesList();
+        seedInitialChartData();
+        fetchTelemetryAndPredict();
+        loadAlertHistory();
+    });
 
     // Modals
     const regModal = document.getElementById("registerModal");
@@ -293,14 +567,122 @@ function setupEventListeners() {
     document.getElementById("closeDroneModalBtn")?.addEventListener("click", () => droneModal?.classList.add("hidden"));
     document.getElementById("cancelDroneBtn")?.addEventListener("click", () => droneModal?.classList.add("hidden"));
 
+    // Register-mine form. The modal and its Register button existed but no
+    // handler was attached, so submitting did a native GET form submit that
+    // reloaded the page and dropped everything that was typed.
+    document.getElementById("registerForm")?.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const form = e.target;
+        const out = document.getElementById("registerResult");
+        const submitBtn = document.querySelector('button[form="registerForm"]');
+        const fd = new FormData(form);
+        const num = (k) => {
+            const v = String(fd.get(k) ?? "").trim();
+            return v === "" ? undefined : Number(v);
+        };
+        const str = (k) => {
+            const v = String(fd.get(k) ?? "").trim();
+            return v === "" ? undefined : v;
+        };
+        const payload = {
+            name: str("name"),
+            company: str("company"),
+            location_name: str("location_name"),
+            latitude: num("latitude"),
+            longitude: num("longitude"),
+            pit_depth_m: num("pit_depth_m"),
+            slope_angle_deg: num("slope_angle_deg"),
+            contact_email: str("contact_email"),
+            contact_phone: str("contact_phone"),
+            alert_threshold_pct: num("alert_threshold_pct"),
+        };
+        // Leave unset optionals out so the API defaults apply.
+        Object.keys(payload).forEach(k => payload[k] === undefined && delete payload[k]);
+
+        if (submitBtn) submitBtn.disabled = true;
+        try {
+            const res = await fetch(`${API_BASE}/mines`, {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify(payload),
+            });
+            const body = await readJsonSafe(res);
+            if (!res.ok) {
+                if (out) {
+                    out.textContent = `Error: ${describeError(body, res.status)}`;
+                    out.style.color = "var(--crit)";
+                    out.classList.remove("hidden");
+                }
+                return;
+            }
+            form.reset();
+            if (out) out.classList.add("hidden");
+            regModal?.classList.add("hidden");
+            // Switch the dashboard to the mine that was just registered.
+            await loadMinesList(body && body.mine_id);
+            seedInitialChartData();
+            fetchTelemetryAndPredict();
+        } catch (err) {
+            if (out) {
+                out.textContent = `Network error: ${err.message}`;
+                out.style.color = "var(--crit)";
+                out.classList.remove("hidden");
+            }
+        } finally {
+            if (submitBtn) submitBtn.disabled = false;
+        }
+    });
+
+    // Drag-and-drop onto the upload zones. The copy says "click or drop",
+    // but dropping a file used to make the browser navigate away to it.
+    function wireDropzone(inputId) {
+        const input = document.getElementById(inputId);
+        const zone = input?.closest(".dropzone");
+        if (!input || !zone) return;
+        ["dragenter", "dragover"].forEach(ev => zone.addEventListener(ev, (e) => {
+            e.preventDefault();
+            zone.classList.add("dragover");
+        }));
+        ["dragleave", "drop"].forEach(ev => zone.addEventListener(ev, (e) => {
+            e.preventDefault();
+            zone.classList.remove("dragover");
+        }));
+        zone.addEventListener("drop", (e) => {
+            if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+            input.files = e.dataTransfer.files;
+            input.dispatchEvent(new Event("change"));
+        });
+    }
+    wireDropzone("csvFileInput");
+    wireDropzone("droneImageInput");
+    // A file dropped anywhere else should not replace the dashboard.
+    window.addEventListener("dragover", (e) => e.preventDefault());
+    window.addEventListener("drop", (e) => e.preventDefault());
+
+    // Render a "Selected File: <name> (<size> KB)" label without
+    // interpolating the (attacker-controlled) file name into an
+    // innerHTML string. The previous version was a DOM-XSS sink:
+    // uploading a file literally named `<img src=x onerror=alert(1)>`
+    // executed the payload as soon as the input changed. Building the
+    // nodes and setting textContent keeps the file name inert.
+    function renderSelectedFileLabel(textElem, file) {
+        textElem.textContent = "";
+        const label = document.createElement("strong");
+        label.textContent = "Selected File: ";
+        textElem.appendChild(label);
+        textElem.appendChild(document.createTextNode(
+            `${file.name} (${(file.size / 1024).toFixed(1)} KB)`
+        ));
+        textElem.style.color = "#3b82f6";
+    }
+
     // Display selected drone image filename on file input change
     const droneInputElem = document.getElementById("droneImageInput") || document.getElementById("droneFileInput");
     droneInputElem?.addEventListener("change", (e) => {
         const file = e.target.files[0];
         const textElem = document.querySelector("#droneModal .dropzone-text span:last-child");
         if (file && textElem) {
-            textElem.innerHTML = `<strong>Selected File:</strong> ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
-            textElem.style.color = "#3b82f6";
+            renderSelectedFileLabel(textElem, file);
         }
     });
 
@@ -309,10 +691,52 @@ function setupEventListeners() {
         const file = e.target.files[0];
         const textElem = document.querySelector("#uploadModal .dropzone-text span:last-child");
         if (file && textElem) {
-            textElem.innerHTML = `<strong>Selected File:</strong> ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
-            textElem.style.color = "#3b82f6";
+            renderSelectedFileLabel(textElem, file);
         }
     });
+
+    // --- Async job helper ------------------------------------------------
+    // /api/upload_csv and /api/analyze_drone_image no longer do the work
+    // inline: they persist the upload, push an arq job and return 202 with
+    // {job_id, poll_url}. Poll that until the worker reports "complete",
+    // then hand back the job's result. If a deployment ever answers with the
+    // finished payload directly (no job_id), pass it straight through.
+    async function awaitJobResult(accepted, onStatus) {
+        if (!accepted || !accepted.job_id) {
+            // Processed inline (no queue): the body is the finished result.
+            if (accepted && accepted.status === "error") {
+                throw new Error(accepted.message || "processing failed");
+            }
+            return accepted;
+        }
+        const pollUrl = accepted.poll_url || `/api/jobs/${accepted.job_id}`;
+        const deadline = Date.now() + 90000;
+        let ticks = 0;
+        while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 800));
+            const res = await fetch(window.location.origin + pollUrl);
+            if (!res.ok) throw new Error(`job status check failed (${res.status})`);
+            const snap = await res.json();
+            if (snap.status === "complete") {
+                if (snap.success === false) {
+                    throw new Error("the worker raised while running this job");
+                }
+                const result = snap.result || {};
+                if (result.status === "error") {
+                    throw new Error(result.message || "the worker returned an error");
+                }
+                return result;
+            }
+            if (snap.status === "not_found") {
+                throw new Error("job expired before it was collected");
+            }
+            if (snap.status === "unavailable") {
+                throw new Error("queue unreachable - is Redis up and the arq worker running?");
+            }
+            if (onStatus) onStatus(snap.status, ++ticks);
+        }
+        throw new Error("timed out after 90s waiting for the worker");
+    }
 
     // CSV Upload Form Submit
     document.getElementById("csvUploadForm")?.addEventListener("submit", async (e) => {
@@ -338,22 +762,28 @@ function setupEventListeners() {
                 method: "POST",
                 body: formData
             });
-            const data = await res.json();
+            const accepted = (await readJsonSafe(res)) || {};
             if (res.ok) {
+                const data = await awaitJobResult(accepted, (state, ticks) => {
+                    resDiv.innerHTML = `\u23f3 Scoring rows on the worker (${state}, ${ticks}s)...`;
+                });
                 resDiv.innerHTML = `
                     <div style="padding: 0.75rem; border-radius: 8px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.4); line-height: 1.6;">
                         <strong style="color: #34d399; font-size: 0.95rem;">✓ Geotechnical Evaluation Complete!</strong><br>
-                        <strong>Dataset:</strong> ${fileInput.files[0].name} (${data.total_records} Telemetry Rows Evaluated)<br>
+                        <strong>Dataset:</strong> ${escapeHtml(fileInput.files[0].name)} (${data.total_records} Telemetry Rows Evaluated)<br>
                         <strong>Mean Failure Risk:</strong> <span style="color: #60a5fa; font-weight: 700;">${data.avg_risk_percentage}%</span> | <strong>Peak Risk:</strong> <span style="color: #f87171; font-weight: 700;">${data.max_risk_percentage}%</span><br>
                         <strong>Risk Tiers:</strong> 🟢 Safe: ${data.safe_records} | 🟡 Warning: ${data.warning_records} | 🔴 Critical: ${data.critical_records}<br>
-                        <strong>Primary Hazard Factor:</strong> ${data.top_risk_driver}
+                        <strong>Primary Hazard Factor:</strong> ${escapeHtml(data.top_risk_driver)}${
+                            Array.isArray(data.columns_used)
+                                ? `<br><strong>Columns used:</strong> ${escapeHtml(data.columns_used.join(", "))}`
+                                : ""}
                     </div>
                 `;
             } else {
-                resDiv.innerHTML = `<span style="color: #ef4444;">Error: ${data.detail}</span>`;
+                showError(resDiv, describeError(accepted, res.status));
             }
         } catch (err) {
-            if (resDiv) resDiv.innerHTML = `<span style="color: #ef4444;">Network Error: ${err.message}</span>`;
+            showError(resDiv, err.message);
         }
     });
 
@@ -382,40 +812,148 @@ function setupEventListeners() {
                 method: "POST",
                 body: formData
             });
-            const data = await res.json();
+            const accepted = (await readJsonSafe(res)) || {};
             if (res.ok) {
+                const data = await awaitJobResult(accepted, (state, ticks) => {
+                    resDiv.innerHTML = `\u23f3 Running the CNN on the worker (${state}, ${ticks}s)...`;
+                });
+                const status = data.anomaly_status ?? "unknown";
+                // The note below is not decoration. The model is a terrain
+                // classifier trained on open-pit bounding boxes; without this
+                // line the panel reads like a crack-severity finding, which
+                // is exactly the overclaim MODEL_CARD.md exists to prevent.
+                const note = data.cnn_trained === false
+                    ? `<div style="margin-top:0.5rem;padding:0.4rem 0.6rem;border-radius:6px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.4);color:#fbbf24;font-size:0.85rem;">
+                           No trained weights loaded - ${data.cnn_architecture}. Treat this as plumbing, not a measurement.
+                       </div>`
+                    : `<div style="margin-top:0.5rem;padding:0.4rem 0.6rem;border-radius:6px;background:rgba(148,163,184,0.1);border:1px solid rgba(148,163,184,0.3);color:#94a3b8;font-size:0.8rem;line-height:1.5;">
+                           ${data.caveat ?? ""}
+                       </div>`;
+                const conf = data.mine_region_confidence_pct;
                 resDiv.innerHTML = `
                     <div style="padding: 0.5rem; border-radius: 6px; background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3);">
-                        <strong style="color: #60a5fa;">CNN Visual Classification:</strong> ${data.visual_status}<br>
-                        <strong>Visual Surface Risk:</strong> ${data.visual_risk_percentage}%<br>
-                        <strong>Crack Density / Anomaly:</strong> ${data.crack_severity}<br>
-                        <strong>Recommendation:</strong> ${data.recommendation}
+                        <strong style="color: #60a5fa;">Classification:</strong> ${status}<br>
+                        <strong>Mine-terrain confidence:</strong> ${conf}% <span style="color:#64748b;">(threshold ${data.decision_threshold})</span><br>
+                        <strong>Edge gradient intensity:</strong> ${data.edge_gradient_intensity} <span style="color:#64748b;">(texture statistic, not a model output)</span><br>
+                        <strong>Next step:</strong> ${data.recommendation}
+                        ${note}
                     </div>
                 `;
             } else {
-                resDiv.innerHTML = `<span style="color: #ef4444;">Error: ${data.detail}</span>`;
+                showError(resDiv, describeError(accepted, res.status));
             }
         } catch (err) {
-            if (resDiv) resDiv.innerHTML = `<span style="color: #ef4444;">Network Error: ${err.message}</span>`;
+            showError(resDiv, err.message);
         }
     });
 }
 
+function showError(el, message) {
+    if (!el) return;
+    el.textContent = "";
+    const span = document.createElement("span");
+    span.style.color = "var(--crit)";
+    span.textContent = `Error: ${message}`;
+    el.appendChild(span);
+    el.classList.remove("hidden");
+}
+
 // Real-Time Telemetry Polling Loop
+// setTimeout chain rather than setInterval: when a poll takes longer than a
+// second (cold model cache, slow weather API) setInterval stacked requests
+// on top of each other and frames arrived out of order on the charts.
+const POLL_INTERVAL_MS = 1000;
+let telemetryInFlight = false;
+// Dismissing the banner used to last exactly one poll: the next frame
+// (a second later) put it straight back. It now stays dismissed until the
+// risk drops below the threshold, i.e. until this alert episode is over.
+let alertDismissed = false;
+
 function startTelemetryPolling() {
-    if (telemetryTimer) clearInterval(telemetryTimer);
-    fetchTelemetryAndPredict();
-    telemetryTimer = setInterval(fetchTelemetryAndPredict, 1000);
+    if (telemetryTimer) clearTimeout(telemetryTimer);
+    const tick = async () => {
+        if (!document.hidden) await fetchTelemetryAndPredict();
+        telemetryTimer = setTimeout(tick, POLL_INTERVAL_MS);
+    };
+    tick();
 }
 
 async function fetchTelemetryAndPredict() {
+    if (telemetryInFlight || !AUTH_TOKEN) return;
+    telemetryInFlight = true;
+    const mineId = activeMineId;
     try {
-        const res = await fetch(`${API_BASE}/telemetry/${activeMineId}?scenario=${currentScenario}`);
+        const res = await fetch(`${API_BASE}/telemetry/${mineId}?scenario=${encodeURIComponent(currentScenario)}`);
         if (!res.ok) return;
         const data = await res.json();
+        // Drop a frame that belongs to the mine we just switched away from.
+        if (mineId !== activeMineId) return;
         updateDashboardUI(data);
+        if (data.alert_recorded) loadAlertHistory();
     } catch (e) {
         console.error("Telemetry fetch error:", e);
+    } finally {
+        telemetryInFlight = false;
+    }
+}
+
+function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, c => (
+        {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]
+    ));
+}
+
+async function loadAlertHistory() {
+    const body = document.getElementById("alertHistoryBody");
+    if (!body || !AUTH_TOKEN) return;
+    try {
+        const res = await fetch(`${API_BASE}/alerts?limit=25`);
+        if (!res.ok) return;
+        const rows = await res.json();
+        body.textContent = "";
+        if (!rows.length) {
+            const tr = document.createElement("tr");
+            const td = document.createElement("td");
+            td.colSpan = 5;
+            td.className = "table-empty";
+            td.textContent = "No alerts recorded yet.";
+            tr.appendChild(td);
+            body.appendChild(tr);
+            return;
+        }
+        rows.forEach(a => {
+            const tr = document.createElement("tr");
+            // triggered_at is stored as naive UTC; mark it so the browser
+            // converts to local time instead of reading it as local.
+            const ts = a.triggered_at
+                ? new Date(/[zZ]|[+-]\d\d:\d\d$/.test(a.triggered_at) ? a.triggered_at : a.triggered_at + "Z")
+                : null;
+            const level = String(a.risk_level || "").toLowerCase();
+            const cells = [
+                [ts ? ts.toLocaleString() : "—", ""],
+                [a.mine_name || `Mine ${a.mine_id}`, ""],
+                [a.risk_percentage != null ? `${Number(a.risk_percentage).toFixed(1)}%` : "—", "num"],
+                [null, ""],
+                [a.top_shap_reason || "—", "reason"],
+            ];
+            cells.forEach(([text, cls], i) => {
+                const td = document.createElement("td");
+                if (cls) td.className = cls;
+                if (i === 3) {
+                    const badge = document.createElement("span");
+                    badge.className = "badge " + (level === "critical" ? "badge-critical"
+                        : level === "warning" ? "badge-warning" : "badge-safe");
+                    badge.textContent = (a.risk_level || "—").toUpperCase();
+                    td.appendChild(badge);
+                } else {
+                    td.textContent = text;
+                }
+                tr.appendChild(td);
+            });
+            body.appendChild(tr);
+        });
+    } catch (e) {
+        console.error("Alert history fetch error:", e);
     }
 }
 
@@ -427,26 +965,26 @@ function updateDashboardUI(data) {
         const pred = data.prediction;
         const weather = data.weather || {};
         const tel = data.telemetry;
-        const threshold = data.alert_threshold_pct || 70.0;
+        const threshold = data.alert_threshold_pct ?? 70.0;
 
         // 1. Update Risk Percentage & Gauge
-        const riskPct = pred.risk_percentage || 0.0;
+        const riskPct = Number(pred.risk_percentage ?? 0);
         const riskLevel = pred.risk_level || "Safe";
-        
+
         const riskPctElem = document.getElementById("riskPctVal");
         if (riskPctElem) riskPctElem.textContent = `${riskPct.toFixed(1)}%`;
-        
+
         // Gauge SVG stroke calculation (perimeter 264)
         const strokeDash = 264 - (264 * (riskPct / 100.0));
         const gaugeFill = document.getElementById("gaugeFill");
         if (gaugeFill) {
             gaugeFill.style.strokeDashoffset = strokeDash;
             if (riskLevel === "Critical" || riskPct >= 65.0) {
-                gaugeFill.style.stroke = "#ef4444";
+                gaugeFill.style.stroke = "#b8625b";
             } else if (riskLevel === "Warning" || riskPct >= 35.0) {
-                gaugeFill.style.stroke = "#f59e0b";
+                gaugeFill.style.stroke = "#c19a4d";
             } else {
-                gaugeFill.style.stroke = "#10b981";
+                gaugeFill.style.stroke = "#4f8f74";
             }
         }
 
@@ -455,7 +993,7 @@ function updateDashboardUI(data) {
         if (badge) {
             badge.className = "badge";
             if (riskLevel === "Critical" || riskPct >= 65.0) {
-                badge.textContent = "CRITICAL / DANGER";
+                badge.textContent = "CRITICAL";
                 badge.classList.add("badge-critical");
             } else if (riskLevel === "Warning" || riskPct >= 35.0) {
                 badge.textContent = "WARNING";
@@ -484,10 +1022,13 @@ function updateDashboardUI(data) {
 
         // 2. Weather Cards
         const wRainElem = document.getElementById("wRainVal");
-        if (wRainElem) wRainElem.textContent = `${(weather.rainfall_mm || tel.rainfall_mm || 0.0).toFixed(1)} mm/h`;
+        // Telemetry rainfall, not the raw weather feed: the heavy-rain and
+        // failure scenarios add simulated rain on top of the live reading,
+        // and the risk model scores the telemetry value.
+        if (wRainElem) wRainElem.textContent = `${Number(tel.rainfall_mm ?? weather.rainfall_mm ?? 0).toFixed(1)} mm/h`;
 
         const wHumElem = document.getElementById("wHumidityVal");
-        if (wHumElem) wHumElem.textContent = `${(weather.humidity_pct || tel.humidity_pct || 55.0).toFixed(1)}%`;
+        if (wHumElem) wHumElem.textContent = `${Number(tel.humidity_pct ?? weather.humidity_pct ?? 55).toFixed(1)}%`;
 
         const wTempElem = document.getElementById("wTempVal");
         if (wTempElem && weather.temperature_c !== undefined) wTempElem.textContent = `${weather.temperature_c.toFixed(1)} °C`;
@@ -505,15 +1046,18 @@ function updateDashboardUI(data) {
             pred.shap_explanations.forEach(reason => {
                 const div = document.createElement("div");
                 div.className = "shap-item";
-                const impactScore = reason.impact_score !== undefined ? reason.impact_score : (reason.impact_value || 0.5);
-                const scoreClass = impactScore > 0 ? "positive" : "negative";
-                div.innerHTML = `
-                    <div class="shap-info">
-                        <h4>${reason.readable_name || reason.feature}</h4>
-                        <p>${reason.explanation}</p>
-                    </div>
-                    <div class="shap-score ${scoreClass}">${impactScore > 0 ? '+' : ''}${impactScore.toFixed(2)}</div>
-                `;
+                const impactScore = Number(reason.impact_score ?? reason.impact_value ?? 0);
+                const info = document.createElement("div");
+                info.className = "shap-info";
+                const h4 = document.createElement("h4");
+                h4.textContent = reason.readable_name || reason.feature;
+                const p = document.createElement("p");
+                p.textContent = reason.explanation || "";
+                info.append(h4, p);
+                const score = document.createElement("div");
+                score.className = `shap-score ${impactScore > 0 ? "positive" : "negative"}`;
+                score.textContent = `${impactScore > 0 ? "+" : ""}${impactScore.toFixed(2)}`;
+                div.append(info, score);
                 shapContainer.appendChild(div);
             });
         }
@@ -536,7 +1080,7 @@ function updateDashboardUI(data) {
             seismicData.shift();
         }
 
-        if (!displacementChart || !porePressureChart || !seismicChart) {
+        if (typeof Chart !== "undefined" && (!displacementChart || !porePressureChart || !seismicChart)) {
             initCharts();
         }
 
@@ -559,7 +1103,9 @@ function updateDashboardUI(data) {
         // 5. Emergency Alert Notification Banner (>60-80% Risk)
         const alertBanner = document.getElementById("emergencyAlertBanner");
         if (alertBanner) {
-            if (riskPct >= threshold) {
+            if (riskPct >= threshold && alertDismissed) {
+                // Episode still running, operator has acknowledged it.
+            } else if (riskPct >= threshold) {
                 alertBanner.classList.remove("hidden");
                 const titleElem = document.getElementById("alertTitle");
                 if (titleElem) titleElem.textContent = `CRITICAL SLOPE COLLAPSE ALERT (${riskPct.toFixed(1)}%)`;
@@ -570,10 +1116,11 @@ function updateDashboardUI(data) {
                 const topShap = pred.shap_explanations && pred.shap_explanations[0] ? pred.shap_explanations[0].explanation : "High Pore Pressure & Acceleration";
                 const shapSumElem = document.getElementById("alertShapSummary");
                 if (shapSumElem) shapSumElem.textContent = `Top Trigger: ${topShap}`;
-                
+
                 playEmergencySiren();
             } else {
                 alertBanner.classList.add("hidden");
+                alertDismissed = false;
             }
         }
     } catch (err) {
