@@ -253,7 +253,9 @@ def _():
 
 @check("weather: async client returns fallback payload on HTTP failure")
 def _():
-    from weather_service import fetch_open_meteo_weather
+    from weather_service import clear_weather_cache, fetch_open_meteo_weather
+
+    clear_weather_cache()
 
     async def go():
         # Coerce httpx to raise: mock AsyncClient.get to blow up.
@@ -269,8 +271,9 @@ def _():
 
 @check("weather: parses successful Open-Meteo response into flat schema")
 def _():
-    from weather_service import fetch_open_meteo_weather
+    from weather_service import clear_weather_cache, fetch_open_meteo_weather
 
+    clear_weather_cache()
     fake_response = MagicMock()
     fake_response.json.return_value = {
         "current": {
@@ -294,8 +297,33 @@ def _():
         assert result["humidity_pct"] == 78.0
         # 6h antecedent sum from the hourly array
         assert abs(result["rain_rolling_6h"] - 3.0) < 1e-6
+        # Variable lists go out comma-separated, as Open-Meteo expects.
+        params = instance.get.call_args.kwargs["params"]
+        assert params["current"].startswith("precipitation,"), params
+        assert params["past_hours"] == 6, params
 
     asyncio.run(go())
+
+
+@check("weather: repeat calls for the same mine are served from cache")
+def _():
+    from weather_service import clear_weather_cache, fetch_open_meteo_weather
+
+    clear_weather_cache()
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"current": {"precipitation": 1.0}, "hourly": {}}
+    fake_response.raise_for_status = MagicMock()
+
+    async def go():
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = MockClient.return_value.__aenter__.return_value
+            instance.get = AsyncMock(return_value=fake_response)
+            for _ in range(5):
+                await fetch_open_meteo_weather(-4.05, 137.11)
+            assert instance.get.await_count == 1, instance.get.await_count
+
+    asyncio.run(go())
+    clear_weather_cache()
 
 
 # ---------------------------------------------------------------------------

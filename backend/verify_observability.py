@@ -207,14 +207,70 @@ def _():
 # ---------------------------------------------------------------------------
 
 
+def _admin_headers(c) -> dict:
+    r = c.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+    assert r.status_code == 200, r.text
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
+@check("upload: /api/upload_csv requires authentication")
+def _():
+    c = _client()
+    r = c.post("/api/upload_csv", files={"file": ("x.csv", b"a,b\n1,2\n", "text/csv")})
+    assert r.status_code == 401, f"expected 401, got {r.status_code}: {r.text}"
+
+
 @check("upload: /api/upload_csv rejects non-CSV content-type with 415")
 def _():
     c = _client()
     r = c.post(
         "/api/upload_csv",
-        files={"file": ("x.csv", b"a,b\n1,2\n", "application/octet-stream")},
+        headers=_admin_headers(c),
+        files={"file": ("x.csv", b"a,b\n1,2\n", "application/pdf")},
     )
     assert r.status_code == 415, f"expected 415, got {r.status_code}: {r.text}"
+
+
+@check("upload: /api/upload_csv accepts .csv sent as application/octet-stream")
+def _():
+    # What Chrome/Edge on Windows send when no app owns .csv. Must be
+    # accepted: 202 when queued, 200 when scored inline (Redis down).
+    c = _client()
+    r = c.post(
+        "/api/upload_csv",
+        headers=_admin_headers(c),
+        files={"file": ("x.CSV", b"a,b\n1,2\n", "application/octet-stream")},
+    )
+    assert r.status_code in (200, 202), f"got {r.status_code}: {r.text}"
+
+
+@check("upload: /api/upload_csv scores inline when the queue is down")
+def _():
+    from app.workers import queue
+
+    c = _client()
+    csv = b"pore_pressure_kpa,velocity_mm_h,seismic_rms_g\n40,0.05,0.02\n120,8.0,0.5\n"
+    orig = queue.enqueue
+
+    async def _down(*_a, **_k):
+        return None
+
+    import main
+
+    main.enqueue = _down
+    try:
+        r = c.post(
+            "/api/upload_csv",
+            headers=_admin_headers(c),
+            files={"file": ("s.csv", csv, "text/csv")},
+        )
+    finally:
+        main.enqueue = orig
+    assert r.status_code == 200, f"got {r.status_code}: {r.text}"
+    body = r.json()
+    assert body["status"] == "success" and body["total_records"] == 2, body
+    assert body["processed"] == "inline", body
+    assert "raw_seismic_rms_g" in body["columns_used"], body
 
 
 @check("upload: /api/upload_csv rejects non-.csv extension with 400")
@@ -222,6 +278,7 @@ def _():
     c = _client()
     r = c.post(
         "/api/upload_csv",
+        headers=_admin_headers(c),
         files={"file": ("x.txt", b"a,b\n1,2\n", "text/csv")},
     )
     assert r.status_code == 400
@@ -232,6 +289,7 @@ def _():
     c = _client()
     r = c.post(
         "/api/analyze_drone_image",
+        headers=_admin_headers(c),
         files={"file": ("x.pdf", b"%PDF-1.4 fake", "application/pdf")},
     )
     assert r.status_code == 415, r.status_code

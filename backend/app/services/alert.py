@@ -16,11 +16,13 @@ always wins.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.redis_client import get_redis
 from app.core.streams import publish_emergency_event
 from app.db.models import AlertLog, Mine
 from app.repositories.alert import AlertRepository
@@ -34,6 +36,20 @@ from app.workers.queue import enqueue
 # equal to the historical ``alert_threshold_pct`` column default so
 # behaviour is unchanged for correctly-configured mines.
 DEFAULT_THRESHOLD_PCT = 70.0
+
+# One recorded + dispatched alert per mine per window. The dashboard polls
+# telemetry every second, so a mine sitting above threshold used to write
+# an alert_logs row, enqueue an embedding job and enqueue an email/SMS
+# dispatch EVERY SECOND -- 3,600 audit rows and 3,600 dispatch attempts an
+# hour for one ongoing event. The banner still shows on every frame; only
+# the side effects are rate-limited. (The dispatch worker's idempotency key
+# is per minute bucket *and* per risk value, so it never deduplicated
+# these: the risk percentage differs on every frame.)
+ALERT_COOLDOWN_SECONDS = 60
+_COOLDOWN_KEY_PREFIX = "rockfallguard:alert:cooldown"
+# Used only while Redis is unreachable, so a dev box without Redis gets
+# the same behaviour. Per-process, which is fine for that case.
+_local_cooldowns: dict[int, float] = {}
 
 
 class TelemetryFrame(dict):
@@ -62,6 +78,34 @@ class AlertService:
         """
         threshold = mine.alert_threshold_pct if mine is not None else DEFAULT_THRESHOLD_PCT
         return risk_percentage >= threshold
+
+    @staticmethod
+    async def claim_alert_slot(
+        mine_id: int, *, cooldown_seconds: int = ALERT_COOLDOWN_SECONDS
+    ) -> bool:
+        """True if this caller should record + dispatch an alert now.
+
+        ``SET NX EX`` in Redis, so with several API workers exactly one of
+        them wins each window. Falls back to an in-process timestamp when
+        Redis is down rather than failing open into the per-second flood.
+        """
+        client = await get_redis()
+        if client is not None:
+            try:
+                acquired = await client.set(
+                    f"{_COOLDOWN_KEY_PREFIX}:{mine_id}",
+                    "1",
+                    ex=cooldown_seconds,
+                    nx=True,
+                )
+                return bool(acquired)
+            except Exception:  # noqa: BLE001 -- fall through to local
+                pass
+        now = time.monotonic()
+        if _local_cooldowns.get(mine_id, 0.0) > now:
+            return False
+        _local_cooldowns[mine_id] = now + cooldown_seconds
+        return True
 
     async def list_recent(
         self, *, scope: TenantScope, limit: int = 50
@@ -160,4 +204,9 @@ class AlertService:
         return job_id
 
 
-__all__ = ["AlertService", "DEFAULT_THRESHOLD_PCT", "TelemetryFrame"]
+__all__ = [
+    "ALERT_COOLDOWN_SECONDS",
+    "AlertService",
+    "DEFAULT_THRESHOLD_PCT",
+    "TelemetryFrame",
+]

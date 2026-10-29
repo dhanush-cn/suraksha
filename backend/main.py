@@ -33,14 +33,13 @@ import os
 
 # app.core.config.Settings requires JWT_SECRET / DATABASE_URL with no
 # built-in defaults (by design -- a production deployment must set them
-# explicitly). These `setdefault` calls only fill them in for local/dev
-# runs that haven't; a real deployment's environment always wins.
-os.environ.setdefault(
-    "JWT_SECRET",
-    "rockfallguard-dev-only-insecure-jwt-secret-do-not-use-in-prod",
-)
-os.environ.setdefault("DATABASE_URL", "sqlite:///./mines.db")
+# explicitly). apply_local_dev_defaults only fills a variable that neither
+# the environment nor backend/.env provides, so .env always wins.
+from app.core.config import apply_local_dev_defaults  # noqa: E402
 
+apply_local_dev_defaults()
+
+import asyncio
 import json
 import shutil
 import uuid
@@ -112,10 +111,16 @@ app.add_middleware(RequestContextMiddleware)
 # cap. Enforced early = cheap.
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=get_settings().max_request_body_bytes)
 
+# CORS comes from settings. It was hardcoded to allow_origins=["*"] with
+# allow_credentials=True, which lets any website a signed-in operator
+# visits make credentialed calls to this API. The dashboard is served
+# from this same origin and needs no CORS at all; a separately hosted
+# frontend lists its origin in CORS_ORIGINS.
+_settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_settings.cors_origin_strings,
+    allow_credentials=_settings.cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -463,6 +468,7 @@ async def predict_hazard(
     principal.authorize_mine(req.mine_id)
     input_data = req.model_dump()
     result = risk.predict(input_data)
+    result["alert_recorded"] = False
 
     # Look the mine up so its configured threshold wins over any hardcode.
     # Fall back to None when the request cites a mine that was deleted
@@ -475,7 +481,8 @@ async def predict_hazard(
 
     if alerts.should_trigger(result["risk_percentage"], mine):
         top_reason = risk.extract_top_reason(result)
-        if mine is not None:
+        if mine is not None and await alerts.claim_alert_slot(mine.id):
+            result["alert_recorded"] = True
             telemetry_view = input_data | {"raw_seismic_rms_g": req.raw_seismic_rms_g}
             await alerts.record(
                 mine_id=mine.id,
@@ -513,7 +520,11 @@ async def get_mine_live_telemetry(
 
     triggered = alerts.should_trigger(prediction["risk_percentage"], mine)
     dispatch_job_id: Optional[str] = None
-    if triggered:
+    # ``triggered`` drives the on-screen banner on every frame; the audit row
+    # and the email/SMS dispatch happen at most once per mine per cooldown
+    # window (see AlertService.claim_alert_slot).
+    recorded = triggered and await alerts.claim_alert_slot(mine.id)
+    if recorded:
         top_reason = risk.extract_top_reason(prediction)
         await alerts.record(
             mine_id=mine.id,
@@ -531,6 +542,7 @@ async def get_mine_live_telemetry(
         "telemetry": telemetry,
         "prediction": prediction,
         "alert_triggered": triggered,
+        "alert_recorded": recorded,
         "alert_threshold_pct": mine.alert_threshold_pct,
         "dispatch_job_id": dispatch_job_id,
     }
@@ -586,14 +598,29 @@ _UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "../data/uploads")
     status_code=202,
     dependencies=[Depends(rate_limit_upload_csv)],
 )
-async def upload_custom_dataset(file: UploadFile = File(...)) -> Dict[str, Any]:
-    if not file.filename or not file.filename.endswith(".csv"):
+async def upload_custom_dataset(
+    file: UploadFile = File(...),
+    principal: Principal = Depends(get_current_principal),
+) -> Dict[str, Any]:
+    if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
     # Content-Type check: the extension can be spoofed, but so can this
     # header -- both together raise the bar without pretending to be a
     # security guarantee. The real check is the worker actually parsing
     # the bytes as CSV via pandas; anything malformed errors there.
-    if file.content_type not in {"text/csv", "application/csv", "application/vnd.ms-excel", "text/plain"}:
+    # application/octet-stream and an empty type are allowed because that
+    # is what Chrome/Edge on Windows send for .csv when no spreadsheet app
+    # has registered the extension -- rejecting them made the upload fail
+    # with a 415 on a stock Windows laptop.
+    if file.content_type not in {
+        "text/csv",
+        "application/csv",
+        "application/vnd.ms-excel",
+        "text/plain",
+        "application/octet-stream",
+        "",
+        None,
+    }:
         raise HTTPException(
             status_code=415,
             detail=f"Unsupported CSV content-type: {file.content_type!r}",
@@ -606,9 +633,15 @@ async def upload_custom_dataset(file: UploadFile = File(...)) -> Dict[str, Any]:
 
     job_id = await enqueue("score_csv", file_path, file.filename)
     if job_id is None:
-        raise HTTPException(
-            status_code=503, detail="Background queue unavailable; try again shortly."
-        )
+        # No Redis / no worker (e.g. Docker Desktop isn't running on a dev
+        # laptop). Score inline on a thread instead of failing: the upload
+        # is capped by max_upload_rows and batch scoring skips SHAP, so a
+        # typical file takes well under a second. 200 + the finished result,
+        # which the dashboard already accepts in place of a job id.
+        from app.workers.tasks import _score_csv_sync
+
+        result = await asyncio.to_thread(_score_csv_sync, file_path, file.filename)
+        return JSONResponse(status_code=200, content=result | {"processed": "inline"})
     return {
         "status": "queued",
         "job_id": job_id,
@@ -622,6 +655,7 @@ async def upload_custom_dataset(file: UploadFile = File(...)) -> Dict[str, Any]:
 @app.api_route("/api/analyze_drone_image/", methods=["GET", "POST"], status_code=202)
 async def analyze_drone_image_endpoint(
     file: Optional[UploadFile] = File(None),
+    principal: Principal = Depends(get_current_principal),
 ) -> Dict[str, Any]:
     if file is None:
         raise HTTPException(status_code=400, detail="Please select an image file to upload.")
@@ -644,9 +678,11 @@ async def analyze_drone_image_endpoint(
 
     job_id = await enqueue("analyze_image", image_path)
     if job_id is None:
-        raise HTTPException(
-            status_code=503, detail="Background queue unavailable; try again shortly."
-        )
+        # Same inline fallback as /api/upload_csv when the queue is down.
+        from app.workers.tasks import _analyze_image_sync
+
+        result = await asyncio.to_thread(_analyze_image_sync, image_path)
+        return JSONResponse(status_code=200, content=result | {"processed": "inline"})
     return {
         "status": "queued",
         "job_id": job_id,

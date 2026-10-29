@@ -34,11 +34,9 @@ if str(BACKEND_DIR) not in sys.path:
 
 # Match main.py's defaults so `alembic upgrade head` from a bare
 # checkout doesn't require exporting env vars.
-os.environ.setdefault(
-    "JWT_SECRET",
-    "rockfallguard-dev-only-insecure-jwt-secret-do-not-use-in-prod",
-)
-os.environ.setdefault("DATABASE_URL", "sqlite:///./mines.db")
+from app.core.config import apply_local_dev_defaults  # noqa: E402
+
+apply_local_dev_defaults()
 
 from app.db.base import Base  # noqa: E402
 from app.db.engine import _normalise_dsn, get_engine  # noqa: E402

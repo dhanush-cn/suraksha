@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 import redis.asyncio as aioredis
@@ -36,17 +37,29 @@ logger = logging.getLogger(__name__)
 _client: Redis | None = None
 _client_loop_id: int | None = None
 
+# Negative cache. Without it, every caller on every request (rate limiter,
+# blocklist, mine cache, stream...) re-dials a Redis that is down and pays
+# the connect timeout each time -- a single dashboard poll touches Redis
+# four or five times, so a missing Redis turned a 50 ms request into a
+# multi-second one. After a failed dial we answer "unavailable" straight
+# away for this long, then try again.
+_RETRY_AFTER_SECONDS = 5.0
+_down_until: float = 0.0
+
 
 async def get_redis() -> Optional[Redis]:
     """Return the process-wide async Redis client, or ``None`` if unreachable."""
-    global _client, _client_loop_id
-    current_loop_id = id(asyncio.get_running_loop())
+    global _client, _client_loop_id, _down_until
+    loop = asyncio.get_running_loop()
+    current_loop_id = id(loop)
     if _client is not None and _client_loop_id == current_loop_id:
         return _client
     if _client is not None:
         logger.debug("resetting stale redis client from prior event loop")
         _client = None
         _client_loop_id = None
+    if time.monotonic() < _down_until:
+        return None
 
     settings = get_settings()
     try:
@@ -66,7 +79,11 @@ async def get_redis() -> Optional[Redis]:
         )
         await client.ping()
     except Exception as exc:  # noqa: BLE001 -- any failure is "Redis down"
-        logger.warning("redis client unavailable: %s", exc)
+        # Log once per back-off window rather than once per call.
+        logger.warning(
+            "redis unavailable (%s); not retrying for %.0fs", exc, _RETRY_AFTER_SECONDS
+        )
+        _down_until = time.monotonic() + _RETRY_AFTER_SECONDS
         return None
     _client = client
     _client_loop_id = current_loop_id
@@ -83,9 +100,10 @@ async def close_redis() -> None:
 
 def reset_client_for_tests() -> None:
     """Drop the cache without awaiting close -- only for tests."""
-    global _client, _client_loop_id
+    global _client, _client_loop_id, _down_until
     _client = None
     _client_loop_id = None
+    _down_until = 0.0
 
 
 __all__ = ["close_redis", "get_redis", "reset_client_for_tests"]

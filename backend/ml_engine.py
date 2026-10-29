@@ -18,6 +18,10 @@ _SCALER = None
 _EXPLAINER = None
 _FEATURE_NAMES = None
 
+class _SkipExplain(Exception):
+    """Internal: short-circuits the SHAP block when explain=False."""
+
+
 def butter_lowpass_filter(data: np.ndarray, cutoff=15.0, fs=100.0, order=4) -> np.ndarray:
     nyquist = 0.5 * fs
     normal_cutoff = cutoff / nyquist
@@ -43,9 +47,8 @@ def load_ml_artifacts():
                 extra={"error": str(e), "models_dir": MODELS_DIR},
             )
 
-def predict_rockfall_risk(sensor_input: Dict[str, Any]) -> Dict[str, Any]:
-    load_ml_artifacts()
-    
+def _feature_row(sensor_input: Dict[str, Any]) -> Dict[str, float]:
+    """Raw sensor frame -> the 13 model features (same rules for one row or a batch)."""
     # 1. Parse Input Telemetry
     rainfall = float(sensor_input.get("rainfall_mm", 0.0))
     humidity = float(sensor_input.get("humidity_pct", 50.0))
@@ -90,7 +93,36 @@ def predict_rockfall_risk(sensor_input: Dict[str, Any]) -> Dict[str, Any]:
         "vel_rolling_max": vel_rolling_max,
         "pore_rolling_mean": pore_rolling_mean
     }
+    return feature_dict
+
+
+def predict_rockfall_risk(sensor_input: Dict[str, Any], explain: bool = True) -> Dict[str, Any]:
+    """Score one sensor frame.
+
+    ``explain=False`` skips the SHAP pass. Batch CSV scoring only reports
+    aggregate risk tiers, and SHAP was ~90% of its per-row cost.
+    """
+    load_ml_artifacts()
+    if _CLF_MODEL is None:
+        raise RuntimeError(
+            "ML model artifacts are missing from models/. Run `python ml/train_model.py` "
+            "from the repository root to generate them."
+        )
     
+    feature_dict = _feature_row(sensor_input)
+    rainfall = feature_dict["rainfall_mm"]
+    humidity = feature_dict["humidity_pct"]
+    pore_pressure = feature_dict["pore_pressure_kpa"]
+    displacement = feature_dict["displacement_mm"]
+    velocity = feature_dict["velocity_mm_h"]
+    acceleration = feature_dict["acceleration_mm_h2"]
+    filtered_seismic = feature_dict["filtered_seismic_g"]
+    hydro_kinematic_index = feature_dict["hydro_kinematic_index"]
+    rain_rolling_6h = feature_dict["rain_rolling_6h"]
+    vel_rolling_mean = feature_dict["vel_rolling_mean"]
+    vel_rolling_max = feature_dict["vel_rolling_max"]
+    pore_rolling_mean = feature_dict["pore_rolling_mean"]
+
     input_df = pd.DataFrame([feature_dict])[_FEATURE_NAMES]
     input_scaled = _SCALER.transform(input_df)
     
@@ -113,6 +145,8 @@ def predict_rockfall_risk(sensor_input: Dict[str, Any]) -> Dict[str, Any]:
     # 4. SHAP Feature Explanation Calculation
     shap_reasons = []
     try:
+        if not explain:
+            raise _SkipExplain()
         shap_vals = _EXPLAINER.shap_values(input_scaled)
         # SHAP outputs matrix for multiclass or vector for single output
         if isinstance(shap_vals, list):
@@ -133,7 +167,12 @@ def predict_rockfall_risk(sensor_input: Dict[str, Any]) -> Dict[str, Any]:
             "rain_rolling_6h": f"Cumulative Rain 6h ({rain_rolling_6h:.1f} mm)",
             "hydro_kinematic_index": f"Hydraulic Pore Pressure & Creep Interaction",
             "filtered_seismic_g": f"Geophone Microseismic Acoustic Emission ({filtered_seismic:.3f} g)",
-            "fracture_instability_index": f"Acoustic Fracture Acceleration Index"
+            "fracture_instability_index": "Acoustic Fracture Acceleration Index",
+            "vel_rolling_mean": f"Mean Slope Velocity, recent window ({vel_rolling_mean:.2f} mm/h)",
+            "vel_rolling_max": f"Peak Slope Velocity, recent window ({vel_rolling_max:.2f} mm/h)",
+            "pore_rolling_mean": f"Mean Pore Pressure, recent window ({pore_rolling_mean:.1f} kPa)",
+            "humidity_pct": f"Relative Humidity ({humidity:.0f}%)",
+            "displacement_mm": f"Cumulative Displacement ({displacement:.1f} mm)",
         }
         
         for idx in top_indices:
@@ -147,6 +186,8 @@ def predict_rockfall_risk(sensor_input: Dict[str, Any]) -> Dict[str, Any]:
                 "impact_score": float(np.round(impact_val, 4)),
                 "explanation": f"{direction} {readable} (Impact: {impact_val:+.2f})"
             })
+    except _SkipExplain:
+        shap_reasons = []
     except Exception as e:
         logger.warning("SHAP explanation failed; using default reason", extra={"error": str(e)})
         shap_reasons = [{"feature": "velocity_mm_h", "readable_name": "Displacement Velocity", "impact_score": 0.5, "explanation": "Displacement velocity rate"}]
@@ -165,6 +206,26 @@ def predict_rockfall_risk(sensor_input: Dict[str, Any]) -> Dict[str, Any]:
             "filtered_seismic_g": float(np.round(filtered_seismic, 4))
         }
     }
+
+def score_risk_batch(rows: List[Dict[str, Any]]) -> List[float]:
+    """Risk percentage (0-100) for many frames in one vectorised call.
+
+    Same features and same clipping as predict_rockfall_risk, without the
+    per-row classifier/SHAP work. Used by CSV scoring: one scaler + one
+    regressor call for the whole file instead of one per row (~45 ms each).
+    """
+    load_ml_artifacts()
+    if _REG_MODEL is None:
+        raise RuntimeError(
+            "ML model artifacts are missing from models/. Run `python ml/train_model.py` "
+            "from the repository root to generate them."
+        )
+    if not rows:
+        return []
+    frame = pd.DataFrame([_feature_row(r) for r in rows])[_FEATURE_NAMES]
+    raw = _REG_MODEL.predict(_SCALER.transform(frame))
+    return [float(np.round(np.clip(v, 0.0, 100.0), 1)) for v in raw]
+
 
 if __name__ == "__main__":
     sample_data = {

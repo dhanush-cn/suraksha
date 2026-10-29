@@ -59,6 +59,30 @@ IDEMPOTENCY_LOCK_TTL_SECONDS = 3600  # 1 hour: outlives any retry chain
 # and gives ops a window to inspect a dispatched key before it expires.
 
 
+_CSV_FEATURE_COLUMNS = (
+    "rainfall_mm",
+    "humidity_pct",
+    "pore_pressure_kpa",
+    "displacement_mm",
+    "velocity_mm_h",
+    "acceleration_mm_h2",
+    "raw_seismic_rms_g",
+    "rain_rolling_6h",
+)
+_CSV_COLUMN_ALIASES = {
+    "seismic_rms_g": "raw_seismic_rms_g",
+    "seismic_g": "raw_seismic_rms_g",
+    "rain_6h_mm": "rain_rolling_6h",
+}
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # 1. CSV batch scoring
 # ---------------------------------------------------------------------------
@@ -83,14 +107,35 @@ def _score_csv_sync(file_path: str, filename: str) -> dict[str, Any]:
 
     # Imported lazily: keeps the worker start-up light and avoids paying
     # ml_engine's model-load cost until the first CSV job actually runs.
-    from ml_engine import predict_rockfall_risk
+    from ml_engine import score_risk_batch
 
     if not os.path.exists(file_path):
         return {"status": "error", "message": f"Uploaded file no longer exists: {file_path}"}
 
     max_rows = get_settings().max_upload_rows
-    df = pd.read_csv(file_path)
+    try:
+        df = pd.read_csv(file_path)
+    except Exception as exc:  # noqa: BLE001 -- malformed upload, not a worker bug
+        return {"status": "error", "message": f"Could not parse the file as CSV: {exc}"}
+    finally:
+        # The upload is only needed for this one read; leaving it behind
+        # made data/uploads grow without bound.
+        _remove_quietly(file_path)
+    # Accept the column names exported by the sensor CSVs (and by
+    # data/custom_mine_upload.csv) as well as the API's own field names.
+    # ``seismic_rms_g`` used to be silently ignored, so every row was
+    # scored with the default 0.02 g regardless of what the file said.
+    df = df.rename(columns={k: v for k, v in _CSV_COLUMN_ALIASES.items() if k in df.columns and v not in df.columns})
     rows, cols = df.shape
+    if rows == 0:
+        return {"status": "error", "message": "The CSV has a header but no data rows."}
+    known = set(_CSV_FEATURE_COLUMNS) & set(df.columns)
+    if not known:
+        return {
+            "status": "error",
+            "message": "None of the expected sensor columns were found. Expected some of: "
+            + ", ".join(_CSV_FEATURE_COLUMNS),
+        }
     if rows > max_rows:
         # Bounded by Settings.max_upload_rows so a 10-million-row CSV
         # can't monopolise a worker for hours. Returns an error result
@@ -102,18 +147,23 @@ def _score_csv_sync(file_path: str, filename: str) -> dict[str, Any]:
             "row_count": rows,
             "limit": max_rows,
         }
-    risk_scores: list[float] = []
-    safe_count = warn_count = crit_count = 0
-    for _, row in df.iterrows():
-        pred = predict_rockfall_risk(row.to_dict())
-        rp = pred["risk_percentage"]
-        risk_scores.append(rp)
-        if rp >= 65.0:
-            crit_count += 1
-        elif rp >= 35.0:
-            warn_count += 1
-        else:
-            safe_count += 1
+    # Blank cells arrive as NaN; drop them so the model's defaults apply
+    # instead of NaN propagating into the scaler.
+    frames = [
+        {
+            k: v for k, v in rec.items()
+            if k in known and v is not None and not (isinstance(v, float) and np.isnan(v))
+        }
+        for rec in df.to_dict(orient="records")
+    ]
+    try:
+        risk_scores = score_risk_batch(frames)
+    except (TypeError, ValueError) as exc:
+        return {"status": "error", "message": f"The CSV has a non-numeric sensor value: {exc}"}
+    # Same tier boundaries predict_rockfall_risk uses to override its class.
+    crit_count = sum(1 for rp in risk_scores if rp >= 65.0)
+    warn_count = sum(1 for rp in risk_scores if 35.0 <= rp < 65.0)
+    safe_count = len(risk_scores) - crit_count - warn_count
 
     avg_risk = float(np.mean(risk_scores)) if risk_scores else 0.0
     max_risk = float(np.max(risk_scores)) if risk_scores else 0.0
@@ -128,6 +178,7 @@ def _score_csv_sync(file_path: str, filename: str) -> dict[str, Any]:
         "status": "success",
         "filename": filename,
         "columns": list(df.columns),
+        "columns_used": sorted(known),
         "total_records": int(rows),
         "avg_risk_percentage": round(avg_risk, 1),
         "max_risk_percentage": round(max_risk, 1),
@@ -153,8 +204,11 @@ def _analyze_image_sync(image_path: str) -> dict[str, Any]:
 
     if not os.path.exists(image_path):
         return {"status": "error", "message": f"Image file no longer exists: {image_path}"}
-    with open(image_path, "rb") as f:
-        contents = f.read()
+    try:
+        with open(image_path, "rb") as f:
+            contents = f.read()
+    finally:
+        _remove_quietly(image_path)
     return analyze_drone_pit_image(contents)
 
 

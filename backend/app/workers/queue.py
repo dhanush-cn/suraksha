@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -45,6 +46,12 @@ logger = logging.getLogger(__name__)
 # closed" when reused.
 _pool: ArqRedis | None = None
 _pool_loop_id: int | None = None
+
+# Same negative cache as app.core.redis_client: after a failed dial, report
+# "queue down" immediately for a few seconds instead of re-dialling on
+# every enqueue (each triggered alert enqueues two jobs).
+_RETRY_AFTER_SECONDS = 5.0
+_down_until: float = 0.0
 
 
 def build_redis_settings(*, fail_fast: bool = False) -> RedisSettings:
@@ -75,7 +82,7 @@ def build_redis_settings(*, fail_fast: bool = False) -> RedisSettings:
 
 async def get_pool() -> ArqRedis | None:
     """Return a cached ArqRedis pool, or ``None`` if Redis is unreachable."""
-    global _pool, _pool_loop_id
+    global _pool, _pool_loop_id, _down_until
     current_loop_id = id(asyncio.get_running_loop())
     if _pool is not None and _pool_loop_id == current_loop_id:
         return _pool
@@ -86,6 +93,8 @@ async def get_pool() -> ArqRedis | None:
         logger.debug("resetting stale arq pool from prior event loop")
         _pool = None
         _pool_loop_id = None
+    if time.monotonic() < _down_until:
+        return None
     try:
         # API-side enqueue uses fail_fast so a Redis outage returns to
         # the caller quickly instead of piling into redis-py's default
@@ -94,7 +103,10 @@ async def get_pool() -> ArqRedis | None:
         # Ping now so a bad host surfaces here instead of on the first enqueue.
         await pool.ping()
     except Exception as exc:  # noqa: BLE001 -- any failure is "queue down"
-        logger.warning("arq pool unavailable: %s", exc)
+        logger.warning(
+            "arq pool unavailable (%s); not retrying for %.0fs", exc, _RETRY_AFTER_SECONDS
+        )
+        _down_until = time.monotonic() + _RETRY_AFTER_SECONDS
         return None
     _pool = pool
     _pool_loop_id = current_loop_id

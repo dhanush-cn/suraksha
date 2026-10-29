@@ -1,5 +1,6 @@
 from __future__ import annotations
-import json, sys
+import json, logging, os, secrets, sys
+from pathlib import Path
 from enum import StrEnum
 from functools import lru_cache
 from typing import Annotated, Any, Final, Literal
@@ -7,6 +8,49 @@ from pydantic import AnyHttpUrl, Field, RedisDsn, SecretStr, ValidationError, fi
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 MIN_SECRET_LENGTH: Final[int] = 32
+
+# backend/ -- anchors .env and the default SQLite file so the app behaves the
+# same whether it is started from backend/, the repo root, or an IDE whose
+# working directory is somewhere else entirely.
+BACKEND_DIR: Final[Path] = Path(__file__).resolve().parents[2]
+ENV_FILE: Final[Path] = BACKEND_DIR / ".env"
+DEFAULT_SQLITE_URL: Final[str] = f"sqlite:///{(BACKEND_DIR / 'mines.db').as_posix()}"
+
+
+def apply_local_dev_defaults() -> None:
+    """Fill JWT_SECRET / DATABASE_URL for local runs that didn't set them.
+
+    Only touches a variable that is set NEITHER in the process environment
+    NOR in backend/.env. The previous version did an unconditional
+    ``os.environ.setdefault("JWT_SECRET", "<constant from the repo>")``
+    before Settings loaded; process env outranks .env in pydantic-settings,
+    so the per-machine secret run-demo.ps1 writes to .env was silently
+    ignored and every token was signed with a string published on GitHub.
+
+    The fallback secret is random per process: tokens stop validating on
+    restart (you sign in again), which is the right failure for a dev box
+    with no configuration.
+    """
+    from_file: dict[str, str | None] = {}
+    if ENV_FILE.is_file():
+        try:
+            from dotenv import dotenv_values
+
+            from_file = {k.upper(): v for k, v in dotenv_values(ENV_FILE).items()}
+        except Exception:  # noqa: BLE001 -- unreadable .env: Settings reports it
+            from_file = {}
+
+    def _is_set(name: str) -> bool:
+        return bool(os.environ.get(name)) or bool(from_file.get(name))
+
+    if not _is_set("DATABASE_URL"):
+        os.environ["DATABASE_URL"] = DEFAULT_SQLITE_URL
+    if not _is_set("JWT_SECRET"):
+        os.environ["JWT_SECRET"] = secrets.token_hex(32)
+        logging.getLogger(__name__).warning(
+            "JWT_SECRET not configured; using a random per-process secret. "
+            "Tokens will not survive a restart. Set it in %s.", ENV_FILE
+        )
 
 class Environment(StrEnum):
     DEVELOPMENT = "development"; STAGING = "staging"; PRODUCTION = "production"; TEST = "test"
@@ -19,7 +63,7 @@ class LogLevel(StrEnum):
     DEBUG = "DEBUG"; INFO = "INFO"; WARNING = "WARNING"; ERROR = "ERROR"; CRITICAL = "CRITICAL"
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=(".env",".env.local"), env_file_encoding="utf-8", env_nested_delimiter="__", case_sensitive=False, extra="ignore", frozen=True)
+    model_config = SettingsConfigDict(env_file=(str(ENV_FILE), ".env", ".env.local"), env_file_encoding="utf-8", env_nested_delimiter="__", case_sensitive=False, extra="ignore", frozen=True)
     environment: Environment = Environment.DEVELOPMENT
     debug: bool = False
     project_name: str = "RockfallGuard"
@@ -138,4 +182,13 @@ def get_settings() -> Settings:
             print(f"  - {location}: {error['msg']}", file=sys.stderr)
         raise SystemExit(1) from exc
 
-__all__ = ["Environment", "LogLevel", "Settings", "get_settings"]
+__all__ = [
+    "BACKEND_DIR",
+    "DEFAULT_SQLITE_URL",
+    "ENV_FILE",
+    "Environment",
+    "LogLevel",
+    "Settings",
+    "apply_local_dev_defaults",
+    "get_settings",
+]

@@ -428,16 +428,20 @@ def _():
         _normalise_dsn("postgresql://u:p@h:5432/d")
         == "postgresql+asyncpg://u:p@h:5432/d"
     )
-    assert _normalise_dsn("sqlite:///./mines.db") == "sqlite+aiosqlite:///./mines.db"
+    # Relative SQLite paths are anchored to backend/, not the CWD, so the
+    # ORM and the legacy seeder (database.py) always open the same file.
+    from app.core.config import BACKEND_DIR
+
+    expected = f"sqlite+aiosqlite:///{(BACKEND_DIR / 'mines.db').resolve().as_posix()}"
+    assert _normalise_dsn("sqlite:///./mines.db") == expected
+    assert _normalise_dsn("sqlite:////tmp/x.db") == "sqlite+aiosqlite:////tmp/x.db"
+    assert _normalise_dsn("sqlite+aiosqlite:///:memory:") == "sqlite+aiosqlite:///:memory:"
     # Leaves already-async DSNs alone.
     assert (
         _normalise_dsn("postgresql+asyncpg://u:p@h/d")
         == "postgresql+asyncpg://u:p@h/d"
     )
-    assert (
-        _normalise_dsn("sqlite+aiosqlite:///./mines.db")
-        == "sqlite+aiosqlite:///./mines.db"
-    )
+    assert _normalise_dsn("sqlite+aiosqlite:///./mines.db") == expected
 
 
 if __name__ == "__main__":

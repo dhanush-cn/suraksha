@@ -27,11 +27,9 @@ import os
 # deployments MUST set these -- os.environ.setdefault leaves anything
 # already exported untouched. Must run BEFORE importing anything that
 # reaches Settings() via app.core.config's lru_cache.
-os.environ.setdefault(
-    "JWT_SECRET",
-    "rockfallguard-dev-only-insecure-jwt-secret-do-not-use-in-prod",
-)
-os.environ.setdefault("DATABASE_URL", "sqlite:///./mines.db")
+from app.core.config import apply_local_dev_defaults  # noqa: E402
+
+apply_local_dev_defaults()
 
 from arq import func  # noqa: E402
 

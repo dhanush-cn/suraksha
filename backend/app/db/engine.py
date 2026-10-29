@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from pathlib import Path
 from typing import AsyncIterator
 
 from sqlalchemy import event
@@ -60,8 +61,29 @@ def _normalise_dsn(raw: str) -> str:
     if raw.startswith("postgresql://") and "+" not in raw.split("://", 1)[0]:
         return "postgresql+asyncpg://" + raw.split("://", 1)[1]
     if raw.startswith("sqlite://") and "+" not in raw.split("://", 1)[0]:
-        return "sqlite+aiosqlite://" + raw.split("://", 1)[1]
-    return raw
+        raw = "sqlite+aiosqlite://" + raw.split("://", 1)[1]
+    return _anchor_relative_sqlite(raw)
+
+
+def _anchor_relative_sqlite(dsn: str) -> str:
+    """Resolve a relative SQLite path against backend/, not the CWD.
+
+    ``sqlite:///./mines.db`` used to mean "wherever the process happened to
+    start". The legacy seeder (database.init_db) always writes
+    backend/mines.db, so starting uvicorn from any other directory gave
+    the ORM a fresh, table-less file next to it and every /api/mines call
+    a 500. Absolute paths and in-memory databases are left alone.
+    """
+    prefix = "sqlite+aiosqlite:///"
+    if not dsn.startswith(prefix):
+        return dsn
+    path, sep, query = dsn[len(prefix):].partition("?")
+    if not path or path == ":memory:" or path.startswith("/") or Path(path).is_absolute():
+        return dsn
+    from app.core.config import BACKEND_DIR
+
+    anchored = (BACKEND_DIR / path).resolve().as_posix()
+    return f"{prefix}{anchored}{sep}{query}"
 
 
 def _build_engine() -> AsyncEngine:

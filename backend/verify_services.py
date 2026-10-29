@@ -90,6 +90,27 @@ def _migrate() -> None:
 # ---------------------------------------------------------------------------
 
 
+@check("alert: claim_alert_slot allows one recorded alert per mine per window")
+def _():
+    import asyncio
+    import random
+
+    from app.services import AlertService
+
+    mine_id = random.randint(10_000_000, 99_999_999)  # never collides with real rows
+
+    async def go():
+        first = await AlertService.claim_alert_slot(mine_id, cooldown_seconds=5)
+        second = await AlertService.claim_alert_slot(mine_id, cooldown_seconds=5)
+        other = await AlertService.claim_alert_slot(mine_id + 1, cooldown_seconds=5)
+        return first, second, other
+
+    first, second, other = asyncio.run(go())
+    assert first is True, "first alert in a window must be recorded"
+    assert second is False, "a second alert in the same window must be suppressed"
+    assert other is True, "the cooldown is per mine, not global"
+
+
 @check("alert: should_trigger uses the mine's configured threshold")
 def _():
     from app.services.alert import DEFAULT_THRESHOLD_PCT, AlertService
