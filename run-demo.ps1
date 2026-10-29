@@ -1,20 +1,19 @@
 # RockfallGuard - local demo launcher
 #
-# Starts the API + dashboard on http://localhost:8005 using the existing
-# .venv (Python 3.12). Core demo path (login, mine list, live telemetry,
-# risk prediction, SHAP, alert history) needs nothing but this script.
+# Brings up the whole stack:
+#   Redis (docker compose)  -> rate limiter, JWT blocklist, arq queue
+#   arq worker (own window) -> CSV scoring + drone CNN jobs
+#   uvicorn (this window)   -> API + dashboard on http://localhost:8005
 #
-# Not covered here, because both need Redis + the arq worker:
-#   * CSV upload   -> /api/upload_csv enqueues a background job
-#   * /health/ready -> reports 503 while Redis is unreachable (expected)
-# To demo those, run `docker compose -f docker-compose.dev.yml up -d`
-# and `.\.venv\Scripts\arq.exe app.workers.settings.WorkerSettings`
-# from the backend folder in a second window first.
+# Without Docker the API still runs and the dashboard, telemetry, risk
+# scoring and SHAP all work; only /api/upload_csv and
+# /api/analyze_drone_image need the queue, and they report that plainly.
 
 $ErrorActionPreference = 'Stop'
 
 $repo = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $py   = Join-Path $repo '.venv\Scripts\python.exe'
+$arq  = Join-Path $repo '.venv\Scripts\arq.exe'
 
 if (-not (Test-Path $py)) {
     throw "No virtualenv at $py. Create one with: py -3.12 -m venv .venv; .\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt"
@@ -22,23 +21,69 @@ if (-not (Test-Path $py)) {
 
 Set-Location (Join-Path $repo 'backend')
 
-# Config. Settings has no defaults for JWT_SECRET / DATABASE_URL by design,
-# so write a dev .env once if it isn't there. ASCII on purpose: PowerShell's
-# `>` writes UTF-16, which pydantic-settings cannot read.
+# --- config ---------------------------------------------------------------
+# Settings has no defaults for JWT_SECRET / DATABASE_URL by design. ASCII on
+# purpose: PowerShell's `>` writes UTF-16, which pydantic-settings can't read.
 if (-not (Test-Path '.env')) {
     $secret = & $py -c "import secrets; print(secrets.token_hex(32))"
     Set-Content -Path '.env' -Encoding ascii -Value @(
         "JWT_SECRET=$secret",
         "DATABASE_URL=sqlite:///./mines.db",
+        "REDIS_URL=redis://127.0.0.1:6379/0",
         "LOG_JSON=false"
     )
     Write-Host "[setup] wrote backend\.env with a fresh dev JWT secret" -ForegroundColor Yellow
 }
 
-Write-Host "[1/3] applying migrations" -ForegroundColor Cyan
+# 127.0.0.1, never "localhost": on Windows localhost resolves to ::1 first,
+# Docker publishes Redis on IPv4 only, and the v6 attempt burns the full
+# redis_socket_timeout_seconds (2s) on EVERY request before falling back.
+if (-not (Select-String -Path '.env' -Pattern '^REDIS_URL=' -Quiet)) {
+    Add-Content -Path '.env' -Encoding ascii -Value "REDIS_URL=redis://127.0.0.1:6379/0"
+    Write-Host "[setup] pinned REDIS_URL to 127.0.0.1 in backend\.env" -ForegroundColor Yellow
+}
+
+# --- redis ----------------------------------------------------------------
+function Test-Port([int]$port) {
+    try {
+        $c = New-Object Net.Sockets.TcpClient
+        $c.Connect('127.0.0.1', $port); $c.Close(); return $true
+    } catch { return $false }
+}
+
+$redisUp = Test-Port 6379
+if (-not $redisUp) {
+    Write-Host "[1/4] starting Redis via docker compose" -ForegroundColor Cyan
+    $dockerOk = $false
+    try { docker info *> $null; $dockerOk = ($LASTEXITCODE -eq 0) } catch { $dockerOk = $false }
+
+    if ($dockerOk) {
+        Push-Location $repo
+        docker compose -f docker-compose.dev.yml up -d redis
+        Pop-Location
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            if (Test-Port 6379) { $redisUp = $true; break }
+        }
+    } else {
+        Write-Host "      Docker is not responding - start Docker Desktop and re-run" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "[1/4] Redis already listening on 6379" -ForegroundColor Cyan
+}
+
+if ($redisUp) {
+    Write-Host "      Redis up" -ForegroundColor Green
+} else {
+    Write-Host "      no Redis: CSV upload and drone analysis will return 503" -ForegroundColor Yellow
+}
+
+# --- migrations -----------------------------------------------------------
+Write-Host "[2/4] applying migrations" -ForegroundColor Cyan
 & $py -m alembic upgrade head
 
-Write-Host "[2/3] checking ML artifacts" -ForegroundColor Cyan
+# --- ml artifacts ---------------------------------------------------------
+Write-Host "[3/4] checking ML artifacts" -ForegroundColor Cyan
 $needed = @(
     'rockfall_classifier.joblib',
     'rockfall_regressor.joblib',
@@ -48,29 +93,38 @@ $needed = @(
 )
 $missing = $needed | Where-Object { -not (Test-Path (Join-Path $repo "models\$_")) }
 if ($missing) {
-    Write-Host "      missing: $($missing -join ', ')" -ForegroundColor Yellow
-    Write-Host "      regenerating (one-off, ~1 min)..." -ForegroundColor Yellow
+    Write-Host "      missing: $($missing -join ', ') - regenerating (~1 min)" -ForegroundColor Yellow
     Push-Location $repo
     & $py ml\train_model.py
     Pop-Location
 } else {
     Write-Host "      all five present" -ForegroundColor Green
 }
+if (-not (Test-Path (Join-Path $repo 'models\drone_cnn_model.pth'))) {
+    Write-Host "      note: no drone_cnn_model.pth - the CNN reports itself UNTRAINED" -ForegroundColor DarkYellow
+}
 
-Write-Host "[3/3] starting API on http://localhost:8005" -ForegroundColor Cyan
-Write-Host "      dashboard login: admin / admin123" -ForegroundColor Green
-Write-Host "      Ctrl+C to stop" -ForegroundColor DarkGray
+# --- worker ---------------------------------------------------------------
+if ($redisUp -and (Test-Path $arq)) {
+    Write-Host "[4/4] starting arq worker in its own window" -ForegroundColor Cyan
+    Start-Process -FilePath $arq `
+                  -ArgumentList 'app.workers.settings.WorkerSettings' `
+                  -WorkingDirectory (Join-Path $repo 'backend')
+    Start-Sleep -Seconds 3
+}
 
-# Open the dashboard once uvicorn is actually accepting connections.
-# A fixed sleep is not enough: torch + xgboost + shap import slowly on a
-# cold filesystem cache, so a 6s wait landed on ERR_CONNECTION_REFUSED.
+Write-Host ""
+Write-Host "API on http://localhost:8005   login: admin / admin123" -ForegroundColor Green
+Write-Host "Ctrl+C to stop (close the worker window separately)" -ForegroundColor DarkGray
+
+# Open the dashboard only once uvicorn is actually accepting connections -- a
+# fixed sleep raced the import of torch/xgboost/shap on a cold cache.
 Start-Job -ScriptBlock {
     for ($i = 0; $i -lt 60; $i++) {
         Start-Sleep -Seconds 1
         try {
             $c = New-Object Net.Sockets.TcpClient
-            $c.Connect('127.0.0.1', 8005)
-            $c.Close()
+            $c.Connect('127.0.0.1', 8005); $c.Close()
             Start-Process 'http://localhost:8005'
             return
         } catch { }

@@ -103,6 +103,53 @@ def _decision_threshold() -> float:
     return _THRESHOLD
 
 
+_TILE = 224
+_MAX_TILES = 36
+
+
+def _tile_image(image: "Image.Image"):
+    """Cut the frame into overlapping windows at the model's training scale.
+
+    Returns (batch_tensor, boxes). Windows are half-overlapping so a pit
+    straddling a tile boundary still lands whole inside a neighbour. The
+    count is capped so a huge upload cannot stall the worker; past the cap
+    the stride widens instead of the window, because changing the window
+    size would change the apparent scale of the terrain and that is the one
+    thing the model is sensitive to.
+
+    A frame smaller than one window is simply resized -- there is nothing
+    to scan.
+    """
+    W, H = image.size
+    win = min(W, H)
+    if win <= _TILE * 1.25:
+        arr = np.asarray(image.resize((_TILE, _TILE)), dtype=np.uint8)
+        batch = torch.from_numpy(arr).unsqueeze(0)
+        return batch.permute(0, 3, 1, 2).contiguous().float().div_(255.0), [(0, 0, W, H)]
+
+    # Window at roughly a third of the short edge: the annotated pit regions
+    # in the training set occupy that order of magnitude within their scenes.
+    win = max(_TILE, int(min(W, H) / 3))
+    stride = max(1, win // 2)
+    while ((W - win) // stride + 1) * ((H - win) // stride + 1) > _MAX_TILES:
+        stride = int(stride * 1.4) + 1
+
+    crops, boxes = [], []
+    for y in range(0, max(1, H - win + 1), stride):
+        for x in range(0, max(1, W - win + 1), stride):
+            box = (x, y, x + win, y + win)
+            crops.append(np.asarray(
+                image.crop(box).resize((_TILE, _TILE)), dtype=np.uint8))
+            boxes.append(box)
+            if len(crops) >= _MAX_TILES:
+                break
+        if len(crops) >= _MAX_TILES:
+            break
+
+    batch = torch.from_numpy(np.stack(crops))
+    return batch.permute(0, 3, 1, 2).contiguous().float().div_(255.0), boxes
+
+
 def analyze_drone_pit_image(image_bytes: bytes) -> Dict[str, Any]:
     """
     Classifies an aerial image patch as annotated open-pit mine terrain or
@@ -124,15 +171,31 @@ def analyze_drone_pit_image(image_bytes: bytes) -> Dict[str, Any]:
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         image_resized = image.resize((224, 224))
-        img_np = np.array(image_resized, dtype=np.float32) / 255.0
 
-        # Standard PyTorch normalization
-        img_tensor = torch.tensor(img_np).permute(2, 0, 1).unsqueeze(0)
-
-        # Run CNN Forward Pass -- timed for the Prometheus histogram.
+        # Tiled scan, not one downscaled pass over the whole frame.
+        #
+        # The model was trained on CROPS: positives are regions inside an
+        # annotated pit boundary, negatives are background windows. Squashing
+        # a full 1024x1024 scene into 224x224 and asking the same question is
+        # a train/serve mismatch -- the input no longer resembles anything in
+        # the training distribution, and the model answers "background" on
+        # scenes that obviously contain a mine (observed: 0.5% confidence on
+        # a textbook open-pit image).
+        #
+        # Scanning windows at the scale the model was trained on fixes that.
+        # The whole batch goes through in one forward pass, which is only
+        # safe because PitWallCNN.forward uses .reshape rather than .view.
         cnn_model = get_cnn_model()
+        tiles, boxes = _tile_image(image)
         with observe_cv_inference(), torch.no_grad():
-            raw_cnn_score = float(cnn_model(img_tensor).item())
+            scores = cnn_model(tiles).squeeze(1).tolist()
+
+        threshold_for_scan = _decision_threshold()
+        raw_cnn_score = max(scores) if scores else 0.0
+        mean_score = float(np.mean(scores)) if scores else 0.0
+        hits = [i for i, sc in enumerate(scores) if sc >= threshold_for_scan]
+        coverage = (len(hits) / len(scores)) if scores else 0.0
+        peak_box = boxes[int(np.argmax(scores))] if scores else None
             
         # Edge gradient magnitude. Reported as a plain texture statistic.
         # It is NOT blended into the model score: the previous version
@@ -150,9 +213,9 @@ def analyze_drone_pit_image(image_bytes: bytes) -> Dict[str, Any]:
         if is_mine_terrain:
             status = "OPEN-PIT MINE TERRAIN"
             recommendation = (
-                "Scene matches annotated open-pit workings. Pair with sensor "
-                "telemetry for any stability judgement -- this model says "
-                "nothing about slope condition."
+                f"Matched in {len(hits)} of {len(scores)} scanned windows. "
+                "Pair with sensor telemetry for any stability judgement -- "
+                "this model says nothing about slope condition."
             )
         else:
             status = "BACKGROUND / NOT ANNOTATED MINE TERRAIN"
@@ -171,6 +234,14 @@ def analyze_drone_pit_image(image_bytes: bytes) -> Dict[str, Any]:
             "anomaly_status": status,
             "mine_region_confidence_pct": float(np.round(raw_cnn_score * 100.0, 1)),
             "decision_threshold": round(threshold, 3),
+            # Scan detail: a single peak tile on a wide frame is a different
+            # claim from half the frame lighting up, and the caller should be
+            # able to tell those apart.
+            "tiles_scanned": len(scores),
+            "tiles_above_threshold": len(hits),
+            "scene_coverage_pct": float(np.round(coverage * 100.0, 1)),
+            "mean_tile_confidence_pct": float(np.round(mean_score * 100.0, 1)),
+            "peak_tile_box": list(peak_box) if peak_box else None,
             "edge_gradient_intensity": float(np.round(edge_intensity, 2)),
             "recommendation": recommendation,
             "caveat": (
