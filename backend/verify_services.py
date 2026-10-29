@@ -38,6 +38,11 @@ from unittest.mock import MagicMock
 
 os.environ.setdefault("JWT_SECRET", "a" * 48)
 os.environ.setdefault("ENVIRONMENT", "test")
+# Checks that only touch Redis-backed helpers still build Settings, which
+# requires a DATABASE_URL; without a backend/.env (CI) nothing else sets it.
+os.environ.setdefault(
+    "DATABASE_URL", f"sqlite:///{os.path.join(tempfile.gettempdir(), 'rg_verify_services.db')}"
+)
 
 PASS, FAIL = "PASS", "FAIL"
 results: list[tuple[str, str, str]] = []
