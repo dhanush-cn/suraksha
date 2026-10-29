@@ -5,9 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RockfallGuard — Slope Stability Monitor</title>
     <link rel="stylesheet" href="/styles.css">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
+    <!-- Chart.js 4.4.1 and Leaflet 1.9.4 are served from frontend/vendor so the
+         dashboard works offline and on networks that block CDNs. -->
+    <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+    <script src="/vendor/chart.umd.js" defer></script>
+    <script src="/vendor/leaflet/leaflet.js" defer></script>
     <script src="/app.js" defer></script>
 </head>
 <body>
@@ -42,6 +44,7 @@
             <span id="userNameLabel" class="user-name">Signed in</span>
             <span id="userRoleLabel" class="user-role">—</span>
         </div>
+        <button id="logoutBtn" class="btn btn-ghost btn-sm">Sign out</button>
     </div>
 </header>
 
@@ -100,6 +103,7 @@
                 <div class="detail-row"><dt>Pit depth · slope</dt><dd id="infoDepth">—</dd></div>
                 <div class="detail-row"><dt>Alert threshold</dt><dd id="infoThreshold">—</dd></div>
             </dl>
+            <button id="deleteMineBtn" class="btn btn-ghost btn-sm btn-danger admin-only">Remove this mine</button>
         </article>
 
         <article class="card">
@@ -185,6 +189,26 @@
         </article>
     </section>
 
+    <!-- ── Alert history (GET /api/alerts, scope-filtered server-side) ── -->
+    <section>
+        <article class="card">
+            <div class="card-head">
+                <h2 class="card-title">Alert history</h2>
+                <span class="card-sub">Recorded at most once a minute per mine</span>
+            </div>
+            <div class="table-wrap">
+                <table class="alert-table">
+                    <thead>
+                        <tr><th>Time</th><th>Mine</th><th>Risk</th><th>Level</th><th>Top factor</th></tr>
+                    </thead>
+                    <tbody id="alertHistoryBody">
+                        <tr><td colspan="5" class="table-empty">Loading…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </article>
+    </section>
+
 </main>
 
 <!-- ── Register-mine modal ───────────────────────────────────────────── -->
@@ -199,15 +223,17 @@
             <div class="form-row"><label>Company</label><input name="company" required></div>
             <div class="form-row"><label>Location name</label><input name="location_name" required></div>
             <div class="form-grid-2">
-                <div class="form-row"><label>Latitude</label><input name="latitude" type="number" step="0.0001" required></div>
-                <div class="form-row"><label>Longitude</label><input name="longitude" type="number" step="0.0001" required></div>
+                <div class="form-row"><label>Latitude</label><input name="latitude" type="number" step="any" min="-90" max="90" required></div>
+                <div class="form-row"><label>Longitude</label><input name="longitude" type="number" step="any" min="-180" max="180" required></div>
             </div>
             <div class="form-grid-2">
                 <div class="form-row"><label>Pit depth (m)</label><input name="pit_depth_m" type="number" value="350"></div>
                 <div class="form-row"><label>Slope angle (°)</label><input name="slope_angle_deg" type="number" value="48"></div>
             </div>
             <div class="form-row"><label>Contact email</label><input name="contact_email" type="email"></div>
-            <div class="form-row"><label>Alert threshold (%)</label><input name="alert_threshold_pct" type="number" value="70"></div>
+            <div class="form-row"><label>Contact phone</label><input name="contact_phone" type="tel"></div>
+            <div class="form-row"><label>Alert threshold (%)</label><input name="alert_threshold_pct" type="number" value="70" min="1" max="100" step="0.5"></div>
+            <div id="registerResult" class="upload-result hidden"></div>
         </form>
         <div class="modal-foot">
             <button id="cancelRegisterBtn" class="btn btn-ghost">Cancel</button>
