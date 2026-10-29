@@ -181,3 +181,106 @@ Points worth being able to make unprompted:
 - **"Is the model overfitting?"** — On synthetic data that question is almost
   beside the point; the binding limitation is that the data is not real. Being able
   to say *that* is more impressive than a defensive answer.
+
+---
+
+# Model 3 — Aerial terrain CNN (`PitWallCNN`)
+
+Added 2026-10-14.
+
+## What it does, and what it was advertised as doing
+
+The repository shipped a `PitWallCNN` described as detecting "surface crack
+propagation" and returning a "visual risk score". Two problems:
+
+1. **There were no weights.** `models/drone_cnn_model.pth` did not exist, so the
+   network ran randomly initialised.
+2. **The published number was not a model output.** `cv_engine` computed
+   `raw_cnn_score * 0.5 + (edge_intensity / 50.0) * 0.5` and presented the
+   average as a percentage, attaching crack-severity strings by threshold. Half
+   of that figure came from an arbitrary image-processing constant, and the
+   other half from an untrained network.
+
+Both are fixed. The model is now trained, and it reports the task it was
+actually trained on.
+
+## Why it is not a crack model
+
+There is no crack-severity label anywhere in this repository. `data/annotation/`
+contains stub files alternating between `{"shapes": []}` and a single hardcoded
+`crack` rectangle at identical coordinates in every file — placeholders, not
+labels.
+
+The real labels, in `data/Open-Pit-Mine-Object-Detection-Dataset/annotation/`,
+are 1,074 LabelMe files with a **single class** (`"1"`): rectangles around
+open-pit workings in 1024×1024 aerial scenes.
+
+Training a "crack severity" head on those labels would mean inventing the
+target — the same category of error this document exists to retract. So the
+model was trained on the task the labels support:
+
+> binary patch classification — annotated open-pit mine region vs
+> non-overlapping background crop from the same aerial scene
+
+## Data and protocol
+
+- 1,012 usable image/annotation pairs (62 skipped for having no usable box).
+- 900 positive crops from inside annotated regions; 900 negative crops from
+  windows in the same scenes with IoU ≤ 0.02 against every box.
+- **Split grouped by source scene**, 406 / 87 / 88. Crops from one scene share
+  sensor, lighting and terrain; a crop-level split would leak and inflate every
+  number below.
+- Preprocessing identical to inference: resize 224×224, `/255`, no ImageNet
+  normalisation. A mismatch here degrades serving silently.
+- Threshold tuned for F1 on **validation**, then frozen before the test set was
+  touched.
+
+## Held-out results
+
+| | tuned (0.05) | default (0.5) |
+|---|---|---|
+| ROC-AUC | 0.956 | 0.956 |
+| Accuracy | 0.873 | 0.790 |
+| Precision | 0.854 | 0.977 |
+| Recall | 0.909 | 0.606 |
+| F1 | 0.881 | 0.748 |
+
+Confusion at the tuned point: tp 129, fp 22, tn 112, fn 13.
+
+The same reasoning as the rockfall model applies: at 0.5 the model is almost
+never wrong when it says "mine", but misses 39% of them. The tuned point trades
+12 points of precision for 30 points of recall. Both are published above so the
+trade is inspectable rather than asserted.
+
+**Do not quote the accuracy alone.** The test set is 276 crops from 88 scenes;
+the 95% interval on accuracy is roughly ±4 points, so differences smaller than
+that are noise. Grouped k-fold would be the honest next step before comparing
+variants.
+
+## What it does not claim
+
+- Nothing about cracks, crack density or crack severity.
+- Nothing about slope stability, failure probability or rockfall risk.
+- Nothing about imagery containing no mine at all. Every training scene
+  contained at least one, so negatives are *background within mining scenes*.
+  The model has never seen a genuine negative scene.
+
+## Serving
+
+Inference scans overlapping windows at roughly a third of the frame's short
+edge, rather than downscaling the whole frame to 224×224. The model sees crops
+in training; a full scene squashed to 224×224 is out of distribution, and in
+testing returned 0.5% confidence on a textbook open-pit image. The response
+reports peak confidence, how many windows cleared threshold, and the peak
+window's box, so a single hot tile is distinguishable from half the frame
+lighting up.
+
+## Reproducing
+
+```bash
+python ml/train_cnn.py        # seed 1337, 8 epochs, ~3 min on CPU
+cd backend && python verify_cv.py
+```
+
+Writes `models/drone_cnn_model.pth` and `models/cnn_metrics.json`, the latter
+carrying both operating points and an explicit `not_a_claim_about` list.
